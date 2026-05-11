@@ -7,6 +7,7 @@ Frozen reference implementations of stochastic-computing primitives that pre-dat
 
 ## Contents
 
+- `sc.py` — `matmul_sc(...)` reference NumPy implementation of SC matmul (independent-RNG path).
 - `sc_enable.py` — original NumPy/PyTorch-CPU implementation of enable-signal (conditional BSG) SC matmul.
   - `sc_matmul_enable(...)` is the public entrypoint (cycle-by-cycle and k-shortcut paths).
   - Superseded in production by `sc_matmul_enable_triton`, `sc_matmul_enable_triton_mlp`, `sc_matmul_grouped_enable_triton`, `sc_matmul_enable_batched_bipolar` in `scmp_kernels.sc.sc_triton`.
