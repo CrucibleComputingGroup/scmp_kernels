@@ -15,6 +15,11 @@ scmp_kernels/
 │   ├── Diffusion/      # Q-DiT integration (active)
 │   ├── ViT/            # placeholder
 │   └── WorldModel/     # placeholder
+├── evaluation/
+│   ├── Diffusion/      # FID/KID, mosaics, image comparison
+│   ├── ViT/            # placeholder
+│   └── WorldModel/     # placeholder
+├── archived/           # legacy CPU reference impls, bench/compare scripts, dse/calibration utilities
 └── tests/
 ```
 
