@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 def test_import_only():
     from scmp_kernels import sc_matmul                 # noqa: F401
-    from scmp_kernels.sc import sc_matmul, det_kernel_tuning  # noqa: F401
+    from scmp_kernels.sc import sc_matmul  # noqa: F401
 
 
 def test_per_tensor_2d():

@@ -72,6 +72,750 @@ def clear_rng_cache():
     _k_table_cache.clear()
 
 
+# =============================================================================
+# Kernel 1: bin_to_stoc_packed_kernel
+# Converts binary values to packed stochastic bitstreams
+# =============================================================================
+
+@triton.jit
+def bin_to_stoc_packed_kernel(
+    values_ptr,      # (M, N) float32 input matrix
+    packed_ptr,      # (M, N, NUM_PACKS) int64 output (packed bits)
+    rng_seqs_ptr,    # (N, stoc_len) int32 per-element RNG sequences
+    max_val,         # float: max value for normalization
+    max_rng_val,     # int: 2^sc_prec - 1
+    M: tl.constexpr,
+    N: tl.constexpr,
+    stoc_len: tl.constexpr,
+    NUM_PACKS: tl.constexpr,
+):
+    """
+    Convert one matrix element to a packed stochastic bitstream.
+
+    Each program (thread) handles one (m, n) element.
+    Output: NUM_PACKS int64 values containing stoc_len packed bits.
+    """
+    # Get element indices
+    m = tl.program_id(0)
+    n = tl.program_id(1)
+
+    # Bounds check
+    if m >= M or n >= N:
+        return
+
+    # Load the binary value
+    val_offset = m * N + n
+    val = tl.load(values_ptr + val_offset)
+
+    # Compute boundary for stochastic comparison
+    # prob_1 = (val / max_val + 1) / 2  maps [-max_val, max_val] to [0, 1]
+    # boundary = prob_1 * max_rng_val
+    prob_bipolar = val / max_val
+    prob_1 = (prob_bipolar + 1.0) / 2.0
+    boundary = libdevice.nearbyint(prob_1 * max_rng_val).to(tl.int32)
+
+    # Process each pack - use per-element RNG sequence
+    for pack_idx in tl.static_range(NUM_PACKS):
+        # Load 64 RNG values for this pack from THIS element's sequence
+        bit_offsets = pack_idx * 64 + tl.arange(0, 64)
+        mask = bit_offsets < stoc_len
+        # Access rng_seqs[n, bit_offsets] = rng_seqs_ptr + n * stoc_len + bit_offsets
+        rng_vals = tl.load(rng_seqs_ptr + n * stoc_len + bit_offsets, mask=mask, other=max_rng_val + 1)
+
+        # Compare against boundary: 1 if rng_val <= boundary
+        bits = tl.where(boundary > rng_vals, 1, 0).to(tl.int64)
+
+        # Pack bits: sum of (bit << position)
+        bit_positions = tl.arange(0, 64).to(tl.int64)
+        packed_bits = tl.sum(bits << bit_positions)
+
+        # Store packed result
+        out_offset = (m * N + n) * NUM_PACKS + pack_idx
+        tl.store(packed_ptr + out_offset, packed_bits)
+
+
+# =============================================================================
+# Kernel 1b: bin_to_stoc_packed_unipolar_kernel
+# Converts non-negative values to packed stochastic bitstreams (unipolar)
+# =============================================================================
+
+@triton.jit
+def bin_to_stoc_packed_unipolar_kernel(
+    values_ptr,      # (M, N) float32 input matrix, values in [0, max_val]
+    packed_ptr,      # (M, N, NUM_PACKS) int64 output (packed bits)
+    rng_seqs_ptr,    # (N, stoc_len) int32 per-element RNG sequences
+    max_val,         # float: max value for normalization
+    max_rng_val,     # int: 2^sc_prec - 1
+    M: tl.constexpr,
+    N: tl.constexpr,
+    stoc_len: tl.constexpr,
+    NUM_PACKS: tl.constexpr,
+):
+    """
+    Convert one matrix element to a packed stochastic bitstream (unipolar).
+
+    Unipolar encoding: prob = val / max_val, maps [0, max_val] to [0, 1].
+    Used with AND gate for multiplication.
+
+    Each program (thread) handles one (m, n) element.
+    Output: NUM_PACKS int64 values containing stoc_len packed bits.
+    """
+    # Get element indices
+    m = tl.program_id(0)
+    n = tl.program_id(1)
+
+    # Bounds check
+    if m >= M or n >= N:
+        return
+
+    # Load the value
+    val_offset = m * N + n
+    val = tl.load(values_ptr + val_offset)
+
+    # Compute boundary for stochastic comparison
+    # Unipolar: prob = val / max_val, maps [0, max_val] to [0, 1]
+    prob_1 = val / max_val
+    boundary = libdevice.nearbyint(prob_1 * max_rng_val).to(tl.int32)
+
+    # Process each pack - use per-element RNG sequence
+    for pack_idx in tl.static_range(NUM_PACKS):
+        bit_offsets = pack_idx * 64 + tl.arange(0, 64)
+        mask = bit_offsets < stoc_len
+        rng_vals = tl.load(rng_seqs_ptr + n * stoc_len + bit_offsets, mask=mask, other=max_rng_val + 1)
+
+        # Compare against boundary: 1 if rng_val <= boundary
+        bits = tl.where(boundary > rng_vals, 1, 0).to(tl.int64)
+
+        # Pack bits: sum of (bit << position)
+        bit_positions = tl.arange(0, 64).to(tl.int64)
+        packed_bits = tl.sum(bits << bit_positions)
+
+        # Store packed result
+        out_offset = (m * N + n) * NUM_PACKS + pack_idx
+        tl.store(packed_ptr + out_offset, packed_bits)
+
+
+# =============================================================================
+# Kernel 2: xnor_matmul_kernel
+# Computes XNOR-based matrix multiplication using packed streams
+# =============================================================================
+
+@triton.jit
+def xnor_matmul_kernel(
+    Q_packed_ptr,    # (Q_l, Q_e, NUM_PACKS) int64
+    K_packed_ptr,    # (K_l, K_e, NUM_PACKS) int64
+    output_ptr,      # (Q_l, K_l) float32
+    Q_l: tl.constexpr,
+    Q_e: tl.constexpr,
+    K_l: tl.constexpr,
+    NUM_PACKS: tl.constexpr,
+    stoc_len: tl.constexpr,
+    max_val_squared,  # float: max_val^2 for decoding
+):
+    """
+    Compute one output element of the SC matrix multiplication.
+
+    Each program computes output[i, j] = sum_e decode(XNOR(Q[i,e], K[j,e]))
+    """
+    # Get output indices
+    i = tl.program_id(0)  # Q row
+    j = tl.program_id(1)  # K row
+
+    # Bounds check
+    if i >= Q_l or j >= K_l:
+        return
+
+    # Accumulate dot product (scalar)
+    dot_product = 0.0
+
+    # Loop over embedding dimension
+    for e in tl.static_range(Q_e):
+        xnor_ones = 0
+
+        # Process each pack - load all packs for this embedding dim
+        pack_offsets = tl.arange(0, NUM_PACKS)
+        q_base = (i * Q_e + e) * NUM_PACKS
+        k_base = (j * Q_e + e) * NUM_PACKS
+
+        q_packs = tl.load(Q_packed_ptr + q_base + pack_offsets)
+        k_packs = tl.load(K_packed_ptr + k_base + pack_offsets)
+
+        # XNOR = NOT(XOR) for bipolar multiplication
+        xnor_results = ~(q_packs ^ k_packs)
+
+        # Count ones using popcount and sum
+        popcounts = libdevice.popc(xnor_results)
+        xnor_ones = tl.sum(popcounts)
+
+        # Decode bipolar: (2 * xnor_ones / stoc_len - 1) * max_val^2
+        prob_1 = xnor_ones.to(tl.float32) / stoc_len
+        bipolar_val = 2.0 * prob_1 - 1.0
+        decoded = bipolar_val * max_val_squared
+
+        dot_product = dot_product + decoded
+
+    # Store result
+    out_offset = i * K_l + j
+    tl.store(output_ptr + out_offset, dot_product)
+
+
+# =============================================================================
+# Kernel 3: and_matmul_kernel
+# Computes AND-based matrix multiplication using packed streams (unipolar)
+# =============================================================================
+
+@triton.jit
+def and_matmul_kernel(
+    A_packed_ptr,    # (A_l, A_e, NUM_PACKS) int64
+    B_packed_ptr,    # (B_l, B_e, NUM_PACKS) int64
+    output_ptr,      # (A_l, B_l) float32
+    A_l: tl.constexpr,
+    A_e: tl.constexpr,
+    B_l: tl.constexpr,
+    NUM_PACKS: tl.constexpr,
+    stoc_len: tl.constexpr,
+    max_val_squared,  # float: max_val^2 for decoding
+):
+    """
+    Compute one output element of the unipolar SC matrix multiplication.
+
+    Uses AND gate: P(output=1) = P(a=1) * P(b=1)
+    Decode: (ones / stoc_len) * max_val^2
+
+    Each program computes output[i, j] = sum_e decode(AND(A[i,e], B[j,e]))
+    """
+    # Get output indices
+    i = tl.program_id(0)  # A row
+    j = tl.program_id(1)  # B row
+
+    # Bounds check
+    if i >= A_l or j >= B_l:
+        return
+
+    # Accumulate dot product (scalar)
+    dot_product = 0.0
+
+    # Loop over embedding dimension
+    for e in tl.static_range(A_e):
+        # Process each pack - load all packs for this embedding dim
+        pack_offsets = tl.arange(0, NUM_PACKS)
+        a_base = (i * A_e + e) * NUM_PACKS
+        b_base = (j * A_e + e) * NUM_PACKS
+
+        a_packs = tl.load(A_packed_ptr + a_base + pack_offsets)
+        b_packs = tl.load(B_packed_ptr + b_base + pack_offsets)
+
+        # AND gate for unipolar multiplication
+        and_results = a_packs & b_packs
+
+        # Count ones using popcount and sum
+        popcounts = libdevice.popc(and_results)
+        and_ones = tl.sum(popcounts)
+
+        # Decode unipolar: (ones / stoc_len) * max_val^2
+        prob_1 = and_ones.to(tl.float32) / stoc_len
+        decoded = prob_1 * max_val_squared
+
+        dot_product = dot_product + decoded
+
+    # Store result
+    out_offset = i * B_l + j
+    tl.store(output_ptr + out_offset, dot_product)
+
+
+# =============================================================================
+# Kernel 2b: xnor_matmul_tiled_kernel (tiled version)
+# =============================================================================
+
+@triton.jit
+def xnor_matmul_tiled_kernel(
+    Q_packed_ptr,    # (Q_l, Q_e, NUM_PACKS) int64
+    K_packed_ptr,    # (K_l, K_e, NUM_PACKS) int64
+    output_ptr,      # (Q_l, K_l) float32
+    Q_l, Q_e, K_l,
+    NUM_PACKS: tl.constexpr,
+    stoc_len: tl.constexpr,
+    max_val_squared,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Tiled XNOR matmul: each program computes a BLOCK_M x BLOCK_N output tile."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    m_mask = m_offsets < Q_l
+    n_mask = n_offsets < K_l
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    for e in range(Q_e):
+        e_ones = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+
+        for p in tl.static_range(NUM_PACKS):
+            # Load Q tile: Q_packed[m_offsets, e, p] -> [BLOCK_M]
+            q_idx = (m_offsets * Q_e + e) * NUM_PACKS + p
+            q_packs = tl.load(Q_packed_ptr + q_idx, mask=m_mask, other=0)
+
+            # Load K tile: K_packed[n_offsets, e, p] -> [BLOCK_N]
+            k_idx = (n_offsets * Q_e + e) * NUM_PACKS + p
+            k_packs = tl.load(K_packed_ptr + k_idx, mask=n_mask, other=0)
+
+            # XNOR: broadcast [BLOCK_M, 1] x [1, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+            xnor_results = ~(q_packs[:, None] ^ k_packs[None, :])
+            e_ones += libdevice.popc(xnor_results)
+
+        # Decode this embedding dimension
+        prob = e_ones.to(tl.float32) / stoc_len
+        decoded = (2.0 * prob - 1.0) * max_val_squared
+        acc += decoded
+
+    # Store tile
+    out_offsets = m_offsets[:, None] * K_l + n_offsets[None, :]
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
+
+
+# =============================================================================
+# Kernel 3b: and_matmul_tiled_kernel (tiled version)
+# =============================================================================
+
+@triton.jit
+def and_matmul_tiled_kernel(
+    A_packed_ptr,    # (A_l, A_e, NUM_PACKS) int64
+    B_packed_ptr,    # (B_l, B_e, NUM_PACKS) int64
+    output_ptr,      # (A_l, B_l) float32
+    A_l, A_e, B_l,
+    NUM_PACKS: tl.constexpr,
+    stoc_len: tl.constexpr,
+    max_val_squared,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Tiled AND matmul: each program computes a BLOCK_M x BLOCK_N output tile."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = m_offsets < A_l
+    n_mask = n_offsets < B_l
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    for e in range(A_e):
+        e_ones = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+
+        for p in tl.static_range(NUM_PACKS):
+            a_idx = (m_offsets * A_e + e) * NUM_PACKS + p
+            a_packs = tl.load(A_packed_ptr + a_idx, mask=m_mask, other=0)
+
+            b_idx = (n_offsets * A_e + e) * NUM_PACKS + p
+            b_packs = tl.load(B_packed_ptr + b_idx, mask=n_mask, other=0)
+
+            and_results = a_packs[:, None] & b_packs[None, :]
+            e_ones += libdevice.popc(and_results)
+
+        prob = e_ones.to(tl.float32) / stoc_len
+        decoded = prob * max_val_squared
+        acc += decoded
+
+    out_offsets = m_offsets[:, None] * B_l + n_offsets[None, :]
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
+
+
+# =============================================================================
+# Fused SNG+Matmul Kernels (no intermediate packed tensors)
+# =============================================================================
+
+@triton.jit
+def fused_xnor_matmul_kernel(
+    a_ptr,           # (N, D) float32 quantized values
+    b_ptr,           # (M, D) float32 quantized values
+    rng_a_ptr,       # (D, stoc_len) int32
+    rng_b_ptr,       # (D, stoc_len) int32
+    output_ptr,      # (N, M) float32
+    N, D, M,
+    stoc_len: tl.constexpr,
+    NUM_PACKS: tl.constexpr,
+    max_val,         # float: q_max for boundary computation
+    max_rng_val,     # int: 2^sc_prec - 1
+    max_val_squared, # float: q_max^2
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused SNG encoding + XNOR matmul. No intermediate packed tensors.
+
+    For each tile, generates packed bitstreams on-the-fly and immediately
+    computes XNOR + popcount, avoiding global memory writes/reads for
+    the packed representation.
+
+    BLOCK_K tiles the embedding dimension so multiple dims are loaded per
+    iteration, improving data reuse and reducing loop overhead.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = m_offsets < N
+    n_mask = n_offsets < M
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    # Tile the embedding dimension by BLOCK_K
+    num_k_blocks = (D + BLOCK_K - 1) // BLOCK_K
+    for k_block in range(num_k_blocks):
+        k_start = k_block * BLOCK_K
+        # Process each embedding dim within this K-tile
+        for ki in tl.static_range(BLOCK_K):
+            e = k_start + ki
+            if e < D:
+                # Load values for this embedding dim
+                a_vals = tl.load(a_ptr + m_offsets * D + e, mask=m_mask, other=0.0)
+                b_vals = tl.load(b_ptr + n_offsets * D + e, mask=n_mask, other=0.0)
+
+                # Compute boundaries (bipolar encoding)
+                prob_a = (a_vals / max_val + 1.0) / 2.0
+                boundary_a = libdevice.nearbyint(prob_a * max_rng_val).to(tl.int32)
+                prob_b = (b_vals / max_val + 1.0) / 2.0
+                boundary_b = libdevice.nearbyint(prob_b * max_rng_val).to(tl.int32)
+
+                e_ones = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+
+                for p in tl.static_range(NUM_PACKS):
+                    bit_offsets = p * 64 + tl.arange(0, 64)
+                    bit_mask = bit_offsets < stoc_len
+
+                    # Load RNG values for element e, this pack
+                    rng_a_vals = tl.load(rng_a_ptr + e * stoc_len + bit_offsets,
+                                          mask=bit_mask, other=max_rng_val + 1)
+                    rng_b_vals = tl.load(rng_b_ptr + e * stoc_len + bit_offsets,
+                                          mask=bit_mask, other=max_rng_val + 1)
+
+                    # SNG for a: compare boundary_a[BLOCK_M] against rng[64]
+                    a_bits = tl.where(boundary_a[:, None] > rng_a_vals[None, :],
+                                      tl.full([1], 1, dtype=tl.int64),
+                                      tl.full([1], 0, dtype=tl.int64))
+                    bit_positions = tl.arange(0, 64).to(tl.int64)
+                    a_packed = tl.sum(a_bits << bit_positions[None, :], axis=1)  # [BLOCK_M]
+
+                    b_bits = tl.where(boundary_b[:, None] > rng_b_vals[None, :],
+                                      tl.full([1], 1, dtype=tl.int64),
+                                      tl.full([1], 0, dtype=tl.int64))
+                    b_packed = tl.sum(b_bits << bit_positions[None, :], axis=1)  # [BLOCK_N]
+
+                    # XNOR + popcount
+                    xnor = ~(a_packed[:, None] ^ b_packed[None, :])
+                    e_ones += libdevice.popc(xnor)
+
+                # Decode bipolar
+                prob = e_ones.to(tl.float32) / stoc_len
+                decoded = (2.0 * prob - 1.0) * max_val_squared
+                acc += decoded
+
+    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
+
+
+@triton.jit
+def fused_and_matmul_kernel(
+    a_ptr,           # (N, D) float32 quantized values
+    b_ptr,           # (M, D) float32 quantized values
+    rng_a_ptr,       # (D, stoc_len) int32
+    rng_b_ptr,       # (D, stoc_len) int32
+    output_ptr,      # (N, M) float32
+    N, D, M,
+    stoc_len: tl.constexpr,
+    NUM_PACKS: tl.constexpr,
+    max_val,         # float: q_max for boundary computation
+    max_rng_val,     # int: 2^sc_prec - 1
+    max_val_squared, # float: q_max^2
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused SNG encoding + AND matmul (unipolar). No intermediate packed tensors.
+
+    BLOCK_K tiles the embedding dimension for better loop unrolling.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = m_offsets < N
+    n_mask = n_offsets < M
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    num_k_blocks = (D + BLOCK_K - 1) // BLOCK_K
+    for k_block in range(num_k_blocks):
+        k_start = k_block * BLOCK_K
+        for ki in tl.static_range(BLOCK_K):
+            e = k_start + ki
+            if e < D:
+                a_vals = tl.load(a_ptr + m_offsets * D + e, mask=m_mask, other=0.0)
+                b_vals = tl.load(b_ptr + n_offsets * D + e, mask=n_mask, other=0.0)
+
+                # Unipolar encoding: prob = val / max_val
+                boundary_a = libdevice.nearbyint(a_vals / max_val * max_rng_val).to(tl.int32)
+                boundary_b = libdevice.nearbyint(b_vals / max_val * max_rng_val).to(tl.int32)
+
+                e_ones = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+
+                for p in tl.static_range(NUM_PACKS):
+                    bit_offsets = p * 64 + tl.arange(0, 64)
+                    bit_mask = bit_offsets < stoc_len
+
+                    rng_a_vals = tl.load(rng_a_ptr + e * stoc_len + bit_offsets,
+                                          mask=bit_mask, other=max_rng_val + 1)
+                    rng_b_vals = tl.load(rng_b_ptr + e * stoc_len + bit_offsets,
+                                          mask=bit_mask, other=max_rng_val + 1)
+
+                    a_bits = tl.where(boundary_a[:, None] > rng_a_vals[None, :],
+                                      tl.full([1], 1, dtype=tl.int64),
+                                      tl.full([1], 0, dtype=tl.int64))
+                    bit_positions = tl.arange(0, 64).to(tl.int64)
+                    a_packed = tl.sum(a_bits << bit_positions[None, :], axis=1)
+
+                    b_bits = tl.where(boundary_b[:, None] > rng_b_vals[None, :],
+                                      tl.full([1], 1, dtype=tl.int64),
+                                      tl.full([1], 0, dtype=tl.int64))
+                    b_packed = tl.sum(b_bits << bit_positions[None, :], axis=1)
+
+                    # AND + popcount
+                    and_result = a_packed[:, None] & b_packed[None, :]
+                    e_ones += libdevice.popc(and_result)
+
+                # Decode unipolar
+                prob = e_ones.to(tl.float32) / stoc_len
+                decoded = prob * max_val_squared
+                acc += decoded
+
+    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
+
+
+# =============================================================================
+# Fused SNG+Matmul Host Functions
+# =============================================================================
+
+def fused_xnor_matmul(
+    a_int: torch.Tensor, b_int: torch.Tensor,
+    rng_a: torch.Tensor, rng_b: torch.Tensor,
+    q_max: float, sc_prec: int,
+) -> torch.Tensor:
+    """Fused bipolar SNG encoding + XNOR matmul. No intermediate packed tensors."""
+    N, D = a_int.shape
+    M = b_int.shape[0]
+    stoc_len = 2 ** sc_prec
+    NUM_PACKS = stoc_len // 64
+    max_rng_val = 2 ** sc_prec
+    q_max_sq = float(q_max * q_max)
+
+    output = torch.empty(N, M, dtype=torch.float32, device=a_int.device)
+
+    BLOCK_M = 32
+    BLOCK_N = 32
+    # Choose BLOCK_K as the largest divisor of D among {8, 4, 2, 1}, or 8 if D>=8
+    if D >= 8 and D % 8 == 0:
+        BLOCK_K = 8
+    elif D >= 4 and D % 4 == 0:
+        BLOCK_K = 4
+    elif D % 2 == 0:
+        BLOCK_K = 2
+    else:
+        BLOCK_K = 1
+    grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
+    fused_xnor_matmul_kernel[grid](
+        a_int, b_int, rng_a, rng_b, output,
+        N, D, M, stoc_len, NUM_PACKS,
+        float(q_max), max_rng_val, q_max_sq,
+        BLOCK_M, BLOCK_N, BLOCK_K,
+    )
+    return output
+
+
+def fused_and_matmul(
+    a_int: torch.Tensor, b_int: torch.Tensor,
+    rng_a: torch.Tensor, rng_b: torch.Tensor,
+    q_max: float, sc_prec: int,
+) -> torch.Tensor:
+    """Fused unipolar SNG encoding + AND matmul. No intermediate packed tensors."""
+    N, D = a_int.shape
+    M = b_int.shape[0]
+    stoc_len = 2 ** sc_prec
+    NUM_PACKS = stoc_len // 64
+    max_rng_val = 2 ** sc_prec
+    q_max_sq = float(q_max * q_max)
+
+    output = torch.empty(N, M, dtype=torch.float32, device=a_int.device)
+
+    BLOCK_M = 32
+    BLOCK_N = 32
+    if D >= 8 and D % 8 == 0:
+        BLOCK_K = 8
+    elif D >= 4 and D % 4 == 0:
+        BLOCK_K = 4
+    elif D % 2 == 0:
+        BLOCK_K = 2
+    else:
+        BLOCK_K = 1
+    grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
+    fused_and_matmul_kernel[grid](
+        a_int, b_int, rng_a, rng_b, output,
+        N, D, M, stoc_len, NUM_PACKS,
+        float(q_max), max_rng_val, q_max_sq,
+        BLOCK_M, BLOCK_N, BLOCK_K,
+    )
+    return output
+
+
+# =============================================================================
+# Host functions
+# =============================================================================
+
+def bin_to_stoc_packed(values: torch.Tensor, rng_seqs: torch.Tensor,
+                        max_val: float, sc_prec: int) -> torch.Tensor:
+    """
+    Convert a matrix of values to packed stochastic bitstreams.
+
+    Args:
+        values: (M, N) float32 tensor
+        rng_seqs: (N, stoc_len) int32 tensor with per-element RNG sequences
+        max_val: Maximum absolute value for normalization
+        sc_prec: SC precision (determines stoc_len = 2^sc_prec)
+
+    Returns:
+        packed: (M, N, NUM_PACKS) int64 tensor with packed bitstreams
+    """
+    M, N = values.shape
+    stoc_len = 2 ** sc_prec
+    NUM_PACKS = stoc_len // 64
+    max_rng_val = 2 ** sc_prec
+
+    # Allocate output
+    packed = torch.empty((M, N, NUM_PACKS), dtype=torch.int64, device=values.device)
+
+    # Launch kernel
+    grid = (M, N)
+    bin_to_stoc_packed_kernel[grid](
+        values, packed, rng_seqs,
+        max_val, max_rng_val,
+        M, N, stoc_len, NUM_PACKS,
+    )
+
+    return packed
+
+
+def xnor_matmul(Q_packed: torch.Tensor, K_packed: torch.Tensor,
+                Q_l: int, Q_e: int, K_l: int, stoc_len: int,
+                max_val_squared: float) -> torch.Tensor:
+    """
+    Compute XNOR-based matrix multiplication using packed streams.
+
+    Args:
+        Q_packed: (Q_l, Q_e, NUM_PACKS) int64 tensor
+        K_packed: (K_l, K_e, NUM_PACKS) int64 tensor
+        Q_l, Q_e, K_l: Matrix dimensions
+        stoc_len: Stochastic stream length
+        max_val_squared: max_val^2 for decoding
+
+    Returns:
+        output: (Q_l, K_l) float32 tensor
+    """
+    NUM_PACKS = Q_packed.shape[2]
+
+    # Allocate output
+    output = torch.empty((Q_l, K_l), dtype=torch.float32, device=Q_packed.device)
+
+    # Use tiled kernel for better GPU utilization
+    BLOCK_M = 64
+    BLOCK_N = 64
+    grid = (triton.cdiv(Q_l, BLOCK_M), triton.cdiv(K_l, BLOCK_N))
+    xnor_matmul_tiled_kernel[grid](
+        Q_packed, K_packed, output,
+        Q_l, Q_e, K_l, NUM_PACKS, stoc_len,
+        max_val_squared, BLOCK_M, BLOCK_N,
+    )
+
+    return output
+
+
+def bin_to_stoc_packed_unipolar(values: torch.Tensor, rng_seqs: torch.Tensor,
+                                 max_val: float, sc_prec: int) -> torch.Tensor:
+    """
+    Convert a matrix of non-negative values to packed stochastic bitstreams (unipolar).
+
+    Args:
+        values: (M, N) float32 tensor, values in [0, max_val]
+        rng_seqs: (N, stoc_len) int32 tensor with per-element RNG sequences
+        max_val: Maximum value for normalization
+        sc_prec: SC precision (determines stoc_len = 2^sc_prec)
+
+    Returns:
+        packed: (M, N, NUM_PACKS) int64 tensor with packed bitstreams
+    """
+    M, N = values.shape
+    stoc_len = 2 ** sc_prec
+    NUM_PACKS = stoc_len // 64
+    max_rng_val = 2 ** sc_prec
+
+    # Allocate output
+    packed = torch.empty((M, N, NUM_PACKS), dtype=torch.int64, device=values.device)
+
+    # Launch kernel
+    grid = (M, N)
+    bin_to_stoc_packed_unipolar_kernel[grid](
+        values, packed, rng_seqs,
+        max_val, max_rng_val,
+        M, N, stoc_len, NUM_PACKS,
+    )
+
+    return packed
+
+
+def and_matmul(A_packed: torch.Tensor, B_packed: torch.Tensor,
+               A_l: int, A_e: int, B_l: int, stoc_len: int,
+               max_val_squared: float) -> torch.Tensor:
+    """
+    Compute AND-based matrix multiplication using packed streams (unipolar).
+
+    Args:
+        A_packed: (A_l, A_e, NUM_PACKS) int64 tensor
+        B_packed: (B_l, B_e, NUM_PACKS) int64 tensor
+        A_l, A_e, B_l: Matrix dimensions
+        stoc_len: Stochastic stream length
+        max_val_squared: max_val^2 for decoding
+
+    Returns:
+        output: (A_l, B_l) float32 tensor
+    """
+    NUM_PACKS = A_packed.shape[2]
+
+    # Allocate output
+    output = torch.empty((A_l, B_l), dtype=torch.float32, device=A_packed.device)
+
+    # Use tiled kernel for better GPU utilization
+    BLOCK_M = 32
+    BLOCK_N = 32
+    grid = (triton.cdiv(A_l, BLOCK_M), triton.cdiv(B_l, BLOCK_N))
+    and_matmul_tiled_kernel[grid](
+        A_packed, B_packed, output,
+        A_l, A_e, B_l, NUM_PACKS, stoc_len,
+        max_val_squared, BLOCK_M, BLOCK_N,
+    )
+
+    return output
+
 
 # =============================================================================
 # Enable-Signal Kernels (Table-Lookup Matmul)
@@ -1042,12 +1786,11 @@ def fused_quantize_unipolar(
     rows, cols = fp_tensor.shape
     q_max = 2 ** sc_prec - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
-    q_lo, q_hi = 2, q_max - 2  # map min->2, max->253 for 8-bit
     range_fp = max(fp_max - fp_min, 1e-5)
-    scale = range_fp / (q_hi - q_lo)
+    scale = range_fp / q_max
     inv_scale = 1.0 / scale
-    zp = round(-fp_min / scale) + q_lo
-    zp = max(q_lo, min(q_hi, zp))
+    zp = round(-fp_min / scale)
+    zp = max(0, min(q_max, zp))
     zp_f = float(zp)
 
     boundary = torch.empty(rows, cols, dtype=torch.int32, device=fp_tensor.device)
@@ -1219,7 +1962,7 @@ def enable_matmul_bipolar_batched_kernel(
     tl.store(output_ptr + out_base + out_offsets, acc, mask=out_mask)
 
 
-def _sc_matmul_per_head_bipolar(
+def sc_matmul_enable_batched_bipolar(
     q_flat: torch.Tensor,       # (BH, N, D) float32
     k_flat: torch.Tensor,       # (BH, N, D) float32
     q_maxs: torch.Tensor,       # (BH,) float32 — per-head max
@@ -1830,7 +2573,7 @@ def enable_matmul_compact_mlp(
 
 
 @torch.no_grad()
-def _sc_matmul_per_tensor(
+def sc_matmul_enable_triton(
     a: torch.Tensor,
     b: torch.Tensor,
     max_fp_a: float,
@@ -1887,7 +2630,7 @@ def _sc_matmul_per_tensor(
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
 
     if config is None:
-        from .config_helpers import make_sobol_simple_config
+        from config_helpers import make_sobol_simple_config
         config = make_sobol_simple_config(D, D, sc_prec)
 
     device = a.device
@@ -2022,7 +2765,7 @@ def _sc_matmul_enable_triton_batched(
     streams = [torch.cuda.Stream() for _ in range(B)]
     for i in range(B):
         with torch.cuda.stream(streams[i]):
-            output[i] = _sc_matmul_per_tensor(
+            output[i] = sc_matmul_enable_triton(
                 a[i], b[i], max_fp_a, min_fp_a, max_fp_b, min_fp_b,
                 mode, sc_prec, config,
                 stoc_len=stoc_len, rng_levels=rng_levels,
@@ -2086,7 +2829,7 @@ def _sc_matmul_bipolar_mlp_chunked(
     Bipolar SC matmul for MLP with internal chunk_d loop.
 
     Handles the entire D-chunking internally, replacing the Python loop in
-    sc_mlp.py. Key optimizations vs calling _sc_matmul_per_row_mlp in a loop:
+    sc_mlp.py. Key optimizations vs calling sc_matmul_enable_triton_mlp in a loop:
     - Build cum_indicator ONCE (all chunks share same config/RNG)
     - Use fused per-row quant kernel (1 launch vs ~12 PyTorch ops per chunk)
     - No .item() GPU sync calls (bipolar doesn't need max/min)
@@ -2235,7 +2978,7 @@ def _sc_matmul_enable_triton_mlp_batched(
     streams = [torch.cuda.Stream() for _ in range(B)]
     for i in range(B):
         with torch.cuda.stream(streams[i]):
-            output[i] = _sc_matmul_per_row_mlp(
+            output[i] = sc_matmul_enable_triton_mlp(
                 a[i], b[i], max_fp_a, min_fp_a, max_fp_b, min_fp_b,
                 mode, sc_prec, config,
                 stoc_len=stoc_len, rng_levels=rng_levels,
@@ -2246,7 +2989,7 @@ def _sc_matmul_enable_triton_mlp_batched(
 
 
 @torch.no_grad()
-def _sc_matmul_per_row_mlp(
+def sc_matmul_enable_triton_mlp(
     a: torch.Tensor,
     b: torch.Tensor,
     max_fp_a: float = 0.0,
@@ -2305,7 +3048,7 @@ def _sc_matmul_per_row_mlp(
     if mode == "bipolar" and chunk_d > 0 and D > chunk_d:
         # Config is for chunk_d dimensions (not full D)
         if config is None:
-            from .config_helpers import make_sobol_simple_config
+            from config_helpers import make_sobol_simple_config
             config = make_sobol_simple_config(chunk_d, chunk_d, sc_prec)
 
         rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, a.device)
@@ -2326,7 +3069,7 @@ def _sc_matmul_per_row_mlp(
 
     # Standard path (no chunk_d, or unipolar, or D <= chunk_d)
     if config is None:
-        from .config_helpers import make_sobol_simple_config
+        from config_helpers import make_sobol_simple_config
         config = make_sobol_simple_config(D, D, sc_prec)
 
     rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, a.device)
@@ -2376,7 +3119,7 @@ def _sc_matmul_per_row_mlp(
 # =============================================================================
 
 @torch.no_grad()
-def _sc_matmul_per_row(
+def sc_matmul_grouped_enable_triton(
     a: torch.Tensor,
     b: torch.Tensor,
     group_a: int = 1,
@@ -2417,7 +3160,7 @@ def _sc_matmul_per_row(
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
 
     if config is None:
-        from .config_helpers import make_sobol_simple_config
+        from config_helpers import make_sobol_simple_config
         config = make_sobol_simple_config(D, D, sc_prec)
 
     device = a.device
@@ -2578,6 +3321,267 @@ def _sc_matmul_unipolar_grouped_enable(
     return result_fp
 
 
+# =============================================================================
+# sc_matmul: FP-in, FP-out entry point (supports bipolar and unipolar)
+# =============================================================================
+
+@torch.no_grad()
+def sc_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    max_fp_a: float,
+    min_fp_a: float,
+    max_fp_b: float = None,
+    min_fp_b: float = None,
+    mode: str = "bipolar",
+    sc_prec: int = 8,
+    config: Optional[dict] = None,
+) -> torch.Tensor:
+    """
+    Stochastic computing matrix multiplication: a @ b^T.
+
+    FP-in, FP-out. Internally quantizes to integers using Q-DiT-compatible
+    symmetric (bipolar) or asymmetric (unipolar) quantization, performs SC
+    matmul, and dequantizes back to FP.
+
+    Each operand has its own quantization range for better precision.
+    If max_fp_b/min_fp_b are not provided, falls back to using a's range
+    for both operands (shared range, legacy behavior).
+
+    Args:
+        a: Left operand, shape (N, D) or (B, N, D). FP values.
+        b: Right operand, shape (M, D) or (B, M, D). FP values.
+        max_fp_a: Max FP value for operand a.
+        min_fp_a: Min FP value for operand a.
+        max_fp_b: Max FP value for operand b. If None, uses max_fp_a.
+        min_fp_b: Min FP value for operand b. If None, uses min_fp_a.
+        mode: "bipolar" (symmetric, XNOR gate) or "unipolar" (asymmetric, AND gate).
+        sc_prec: SC precision. stoc_len = 2^sc_prec.
+        config: Optional SC RNG/SNG config dict. If None, uses sobol_simple.
+
+    Returns:
+        Result tensor in FP, shape (N, M) or (B, N, M).
+    """
+    if max_fp_b is None:
+        max_fp_b = max_fp_a
+    if min_fp_b is None:
+        min_fp_b = min_fp_a
+
+    if a.dim() == 3:
+        return _sc_matmul_batched(a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, mode, sc_prec, config)
+
+    assert a.dim() == 2 and b.dim() == 2, f"Expected 2D tensors, got a:{a.dim()}D, b:{b.dim()}D"
+    assert a.shape[1] == b.shape[1], f"Embedding dim mismatch: a={a.shape[1]}, b={b.shape[1]}"
+
+    N, D = a.shape
+    M = b.shape[0]
+    stoc_len = 2 ** sc_prec
+
+    # Build config
+    if config is None:
+        from config_helpers import make_sobol_simple_config
+        config = make_sobol_simple_config(D, D, sc_prec)
+
+    # Ensure tensors are on CUDA and float32
+    device = a.device
+    if device.type != 'cuda':
+        a = a.cuda()
+        b = b.cuda()
+    a = a.float()
+    b = b.float()
+
+    # Get cached RNG sequences
+    rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, a.device)
+
+    if mode == "bipolar":
+        result = _sc_matmul_bipolar(
+            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+            rand_seqs_a_t, rand_seqs_b_t, N, D, M, stoc_len,
+        )
+    elif mode == "unipolar":
+        result = _sc_matmul_unipolar(
+            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+            rand_seqs_a_t, rand_seqs_b_t, N, D, M, stoc_len,
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Must be 'bipolar' or 'unipolar'.")
+
+    if device.type != 'cuda':
+        result = result.to(device)
+
+    return result
+
+
+@torch.no_grad()
+def sc_matmul_mlp(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    max_fp_a: float = 0.0,
+    min_fp_a: float = 0.0,
+    max_fp_b: float = None,
+    min_fp_b: float = None,
+    mode: str = "bipolar",
+    sc_prec: int = 8,
+    config: Optional[dict] = None,
+    group_a: int = 1,
+    group_b: int = 1,
+    chunk_d: int = 0,
+) -> torch.Tensor:
+    """
+    SC matmul for MLP layers. Delegates to sc_matmul (packed bitstream
+    kernels work fine for all D sizes). chunk_d is ignored (no chunking needed).
+    """
+    if max_fp_a == 0.0:
+        max_fp_a = a.max().item()
+    if min_fp_a == 0.0:
+        min_fp_a = a.min().item()
+    if max_fp_b is None:
+        max_fp_b = b.max().item()
+    if min_fp_b is None:
+        min_fp_b = b.min().item()
+    return sc_matmul(a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b,
+                     mode, sc_prec, config)
+
+
+def _sc_matmul_bipolar(
+    a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+    rand_seqs_a_t, rand_seqs_b_t, N, D, M, stoc_len,
+):
+    """
+    Bipolar SC matmul (symmetric quantization + XNOR).
+
+    Each operand gets its own symmetric scale:
+        q_max = 2^(sc_prec-1) - 1
+        scale_a = abs_max_a / q_max
+        scale_b = abs_max_b / q_max
+        dequantize: result_fp = sc_raw * (scale_a * scale_b)
+    """
+    q_norm = 2 ** (sc_prec - 1) - 1     # 127: for SNG boundary normalization
+    q_clip = q_norm - 2                  # 125: quantization range & clamp
+
+    # Per-operand symmetric scales (use q_clip so dequant amplifies to compensate SC)
+    abs_max_a = max(abs(max_fp_a), abs(min_fp_a), 1e-5)
+    abs_max_b = max(abs(max_fp_b), abs(min_fp_b), 1e-5)
+    scale_a = abs_max_a / q_clip
+    scale_b = abs_max_b / q_clip
+
+    # Quantize FP -> int with separate scales (clamp to ±q_clip)
+    a_int = (a / scale_a).round().clamp(-q_clip, q_clip)
+    b_int = (b / scale_b).round().clamp(-q_clip, q_clip)
+
+    # Fused SNG + XNOR matmul (boundary normalization uses q_clip=120, so 120→full range)
+    sc_raw = fused_xnor_matmul(a_int, b_int, rand_seqs_a_t, rand_seqs_b_t,
+                                float(q_clip), sc_prec)
+
+    # Dequantize: sc_raw is in integer-product domain
+    result_fp = sc_raw * (scale_a * scale_b)
+
+    return result_fp
+
+
+def _sc_matmul_unipolar(
+    a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+    rand_seqs_a_t, rand_seqs_b_t, N, D, M, stoc_len,
+):
+    """
+    Unipolar SC matmul (asymmetric quantization + AND).
+
+    Each operand gets its own scale and zero_point:
+        scale_a = (max_a - min_a) / q_max,  zp_a = round(-min_a / scale_a)
+        scale_b = (max_b - min_b) / q_max,  zp_b = round(-min_b / scale_b)
+
+    Dequantization with per-operand zero-point correction:
+        SC AND computes: sum_e(a_int_e * b_int_e)
+        Real dot product: sum_e((a_int_e - zp_a)(b_int_e - zp_b))
+        = sum(a_int*b_int) - zp_b*sum(a_int) - zp_a*sum(b_int) + D*zp_a*zp_b
+        result_fp = corrected * (scale_a * scale_b)
+    """
+    q_max = 2 ** sc_prec - 1
+
+    # Per-operand asymmetric scales and zero points
+    range_a = max(max_fp_a - min_fp_a, 1e-5)
+    scale_a = range_a / q_max
+    zp_a = round(-min_fp_a / scale_a)
+    zp_a = max(0, min(q_max, zp_a))
+
+    range_b = max(max_fp_b - min_fp_b, 1e-5)
+    scale_b = range_b / q_max
+    zp_b = round(-min_fp_b / scale_b)
+    zp_b = max(0, min(q_max, zp_b))
+
+    # Quantize FP -> int (non-negative) with separate scales
+    a_int = (a / scale_a + zp_a).round().clamp(0, q_max)
+    b_int = (b / scale_b + zp_b).round().clamp(0, q_max)
+
+    # Fused SNG + AND matmul (no intermediate packed tensors)
+    sc_raw = fused_and_matmul(a_int, b_int, rand_seqs_a_t, rand_seqs_b_t,
+                               float(q_max), sc_prec)
+
+    # Per-operand zero-point correction:
+    # Real dot = sum_e((a_int - zp_a)(b_int - zp_b))
+    # = sum(a_int*b_int) - zp_b*sum(a_int) - zp_a*sum(b_int) + D*zp_a*zp_b
+    zp_a_f = float(zp_a)
+    zp_b_f = float(zp_b)
+    a_sum = a_int.sum(dim=-1, keepdim=True)  # (N, 1)
+    b_sum = b_int.sum(dim=-1, keepdim=True)  # (M, 1)
+
+    # sc_raw: (N, M), a_sum: (N, 1), b_sum.T: (1, M)
+    correction = -zp_b_f * a_sum - zp_a_f * b_sum.transpose(-2, -1) + D * zp_a_f * zp_b_f
+    corrected = sc_raw + correction
+
+    # Dequantize: multiply by per-operand scales
+    result_fp = corrected * (scale_a * scale_b)
+
+    return result_fp
+
+
+def _sc_matmul_unipolar_grouped(
+    a, b, group_a, group_b, sc_prec,
+    rand_seqs_a_t, rand_seqs_b_t, N, D, M, stoc_len,
+):
+    """
+    Unipolar SC matmul with per-row-group quantization.
+
+    Same SNG encoding and AND matmul kernels as _sc_matmul_unipolar, but
+    quantization scales and zero-points are computed per group of rows instead
+    of per-tensor.  This fixes the quality collapse when value distributions
+    vary across rows (e.g. softmax attention where most values ≈ 1/N).
+
+    a: (N, D), b: (M, D).  Computes a @ b^T -> (N, M).
+    group_a: rows per quantization group for a.
+    group_b: rows per quantization group for b.
+    """
+    q_max = 2 ** sc_prec - 1
+
+    # --- per-row-group asymmetric quantization for a ---
+    scale_a_row, zp_a_row, a_int = _grouped_asymmetric_quant(a, group_a, q_max)
+
+    # --- per-row-group asymmetric quantization for b ---
+    scale_b_row, zp_b_row, b_int = _grouped_asymmetric_quant(b, group_b, q_max)
+
+    # --- Fused SNG + AND matmul (no intermediate packed tensors) ---
+    sc_raw = fused_and_matmul(a_int, b_int, rand_seqs_a_t, rand_seqs_b_t,
+                               float(q_max), sc_prec)
+
+    # --- per-element zero-point correction ---
+    # output[i, j] uses zp_a for row i's group and zp_b for row j's group
+    a_sum = a_int.sum(dim=1)   # (N,)
+    b_sum = b_int.sum(dim=1)   # (M,)
+
+    # correction[i,j] = -zp_b[j]*a_sum[i] - zp_a[i]*b_sum[j] + D*zp_a[i]*zp_b[j]
+    correction = (
+        -zp_b_row[None, :] * a_sum[:, None]
+        - zp_a_row[:, None] * b_sum[None, :]
+        + D * zp_a_row[:, None] * zp_b_row[None, :]
+    )
+    corrected = sc_raw + correction
+
+    # --- per-element dequantization ---
+    result_fp = corrected * (scale_a_row[:, None] * scale_b_row[None, :])
+
+    return result_fp
+
+
 def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
     """Per-row-group symmetric quantization for bipolar mode.
 
@@ -2705,209 +3709,470 @@ def _grouped_asymmetric_quant(x, G, q_max):
     return scale_row, zp_row, x_int
 
 
-# =============================================================================
-# det kernel tuning — opt-in tile-size heuristic for SC kernels on EVA-ViTDet
-# shapes. Ported from vit_sc/sc/sc_triton.py.
-#
-# Default (cls / scmp_llm): the bit-stable cls heuristic — (N≤64 or M≤64 → 16,16;
-# else 32,32) — see the in-place pickers inside enable_matmul_triton and
-# _sc_matmul_per_head_bipolar. det runs that enter ``det_kernel_tuning()``
-# switch to ``_pick_enable_block_sizes`` tuned on RTX PRO 6000 Blackwell across
-# det's shape spectrum (SC attn at K∈{88, 256, 6400}; SC linear at M=6400,
-# K∈{1408, 6144}).
-# =============================================================================
-
-_DET_KERNEL_TUNING_DEPTH = 0
-
-
-class det_kernel_tuning:
-    """Re-entrant context manager opting in to det-tuned tile selection."""
-
-    def __enter__(self):
-        global _DET_KERNEL_TUNING_DEPTH
-        _DET_KERNEL_TUNING_DEPTH += 1
-        return self
-
-    def __exit__(self, *_):
-        global _DET_KERNEL_TUNING_DEPTH
-        _DET_KERNEL_TUNING_DEPTH -= 1
-
-
-def _det_kernel_tuning_active() -> bool:
-    return _DET_KERNEL_TUNING_DEPTH > 0
-
-
-def _pick_block_k(D: int) -> int:
-    if D >= 4 and D % 4 == 0:
-        return 4
-    if D % 2 == 0:
-        return 2
-    return 1
-
-
-def _pick_enable_block_sizes(rows_a: int, rows_b: int, D: int) -> tuple:
-    if rows_a <= 64 or rows_b <= 64:
-        return 16, 16, _pick_block_k(D), 2
-    if D <= 256:
-        if rows_a * rows_b >= 1 << 20:
-            return 16, 64, _pick_block_k(D), 8     # global-attn-like
-        return 16, 32, _pick_block_k(D), 4         # window-attn-like
-    if rows_b >= 256:
-        return 32, 64, _pick_block_k(D), 8         # SCLinear (proj/fc1/fc2)
-    return 32, 32, _pick_block_k(D), 8             # global-av (large K, small N)
-
-
-# =============================================================================
-# Batched per-row-group symmetric quant — used by _sc_matmul_per_row_batched.
-# Ported from vit_sc/sc/sc_triton.py.
-# =============================================================================
-
-def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
-    """Batched per-row-group symmetric quant. ``x`` is (BH, rows, cols).
-
-    Currently only ``G == 1`` (per-row) and ``G >= rows`` (per-batch-tensor)
-    are implemented. Returns (scale_row, x_int, sign) shaped (BH, rows[, cols]).
-    """
-    assert x.dim() == 3, f"expected (BH, rows, cols), got {tuple(x.shape)}"
-    BH, rows, cols = x.shape
-    q_clip = q_max - clip_margin
-
-    if G >= rows:
-        abs_max = x.abs().amax(dim=(1, 2)).clamp(min=1e-5)        # (BH,)
-        scale = abs_max / q_clip                                    # (BH,)
-        x_int = (x / scale[:, None, None]).round().clamp(-q_max, q_max)
-        sign = torch.sign(x_int).to(torch.int8)
-        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-        return scale[:, None].expand(BH, rows).contiguous(), x_int, sign
-
-    if G == 1:
-        abs_max = x.abs().amax(dim=2).clamp(min=1e-5)               # (BH, rows)
-        scale = abs_max / q_clip                                    # (BH, rows)
-        x_int = (x / scale[:, :, None]).round().clamp(-q_max, q_max)
-        sign = torch.sign(x_int).to(torch.int8)
-        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-        return scale, x_int, sign
-
-    raise NotImplementedError(
-        f"_grouped_symmetric_quant_batched: G={G} not supported "
-        f"(use G=1 or G>=rows)")
-
-
-# =============================================================================
-# Batched 3D version of _sc_matmul_per_row. Ported from vit_sc.
-# =============================================================================
-
 @torch.no_grad()
-def _sc_matmul_per_row_batched(
+def sc_matmul_grouped(
     a: torch.Tensor,
     b: torch.Tensor,
     group_a: int = 1,
     group_b: int = 1,
-    mode: str = "bipolar",
+    mode: str = "unipolar",
     sc_prec: int = 8,
     config: Optional[dict] = None,
-    stoc_len: Optional[int] = None,
 ) -> torch.Tensor:
-    """Batched 3D version of ``_sc_matmul_per_row``: ``a @ b^T``
-    over a leading batch dim, in one kernel launch.
+    """
+    SC matmul with per-row-group quantization: a @ b^T.
+
+    Same Triton kernels as sc_matmul (single launch for SNG encoding, single
+    launch for AND matmul).  Only the host-side quantization and dequantization
+    use per-row-group scales/zero-points instead of per-tensor.
 
     Args:
-        a: (BH, M, D) left operand.
-        b: (BH, N, D) right operand (already row-major).
-        group_a, group_b: rows per quantization group inside each batch.
-            Currently supports 1 (per-row) or >=rows (per-batch-tensor).
-        mode: "bipolar" only — unipolar falls back to per-batch loop over
-            the 2D entry.
-        sc_prec, config, stoc_len: same semantics as the 2D entry.
+        a: (N, D) left operand.
+        b: (M, D) right operand.
+        group_a: rows per quantization group for a (1 = per-row, N = per-tensor).
+        group_b: rows per quantization group for b (1 = per-row, M = per-tensor).
+        mode: only "unipolar" supported for grouped quantization.
+        sc_prec: SC precision (stoc_len = 2^sc_prec).
+        config: RNG/SNG config dict.
 
     Returns:
-        (BH, M, N) float32.
+        (N, M) result tensor in FP.
     """
-    assert a.dim() == 3 and b.dim() == 3, \
-        f"Expected 3D, got a:{a.dim()}D b:{b.dim()}D"
-    BH, M, D = a.shape
-    BH_b, N, D_b = b.shape
-    assert BH == BH_b, f"batch mismatch: a BH={BH} vs b BH={BH_b}"
-    assert D == D_b, f"inner-dim mismatch: a D={D} vs b D={D_b}"
+    assert a.dim() == 2 and b.dim() == 2, f"Expected 2D, got a:{a.dim()}D b:{b.dim()}D"
+    assert a.shape[1] == b.shape[1], f"Inner dim mismatch: {a.shape[1]} vs {b.shape[1]}"
+    assert mode == "unipolar", "Grouped quantization only supports unipolar mode"
 
-    if stoc_len is None:
-        stoc_len = 2 ** sc_prec
+    N, D = a.shape
+    M = b.shape[0]
+    stoc_len = 2 ** sc_prec
 
     if config is None:
-        from .config_helpers import make_sobol_simple_config
+        from config_helpers import make_sobol_simple_config
         config = make_sobol_simple_config(D, D, sc_prec)
 
     device = a.device
+    if device.type != 'cuda':
+        a = a.cuda()
+        b = b.cuda()
+    a = a.float()
+    b = b.float()
 
-    # Unipolar: no batched kernel yet. Per-batch loop fallback.
-    if mode == "unipolar":
-        out = torch.empty(BH, M, N, dtype=torch.float32, device=device)
-        for i in range(BH):
-            out[i] = _sc_matmul_per_row(
-                a[i].contiguous(), b[i].contiguous(),
-                group_a=group_a, group_b=group_b,
-                mode=mode, sc_prec=sc_prec, config=config, stoc_len=stoc_len,
-            )
-        return out
-    if mode != "bipolar":
-        raise ValueError(f"Unknown mode: {mode}")
+    # Get cached RNG sequences
+    rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, a.device)
 
-    a = a.float().contiguous()
-    b = b.float().contiguous()
-
-    rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, device)
-    V = 2 ** sc_prec + 1
-    cum_table_bytes = D * (stoc_len + 1) * V * 2
-    use_compact = cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES
-
-    # Compact path (forced via env var) not batched yet — per-batch loop.
-    if use_compact:
-        out = torch.empty(BH, M, N, dtype=torch.float32, device=device)
-        for i in range(BH):
-            out[i] = _sc_matmul_per_row(
-                a[i], b[i],
-                group_a=group_a, group_b=group_b,
-                mode=mode, sc_prec=sc_prec, config=config, stoc_len=stoc_len,
-            )
-        return out
-
-    q_max = 2 ** (sc_prec - 1) - 1
-    max_rng_val = 2 ** sc_prec
-    q_max_sq = float(q_max * q_max)
-
-    scale_a_row, a_int, sign_a = _grouped_symmetric_quant_batched(
-        a, group_a, q_max, clip_margin=0)         # scale (BH, M); a_int/sign (BH, M, D)
-    scale_b_row, b_int, sign_b = _grouped_symmetric_quant_batched(
-        b, group_b, q_max, clip_margin=0)         # scale (BH, N); b_int/sign (BH, N, D)
-
-    boundary_a = (a_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, M, D)
-    boundary_b = (b_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, N, D)
-
-    boundary_a_t = boundary_a.transpose(1, 2).contiguous()  # (BH, D, M)
-    sign_a_t = sign_a.transpose(1, 2).contiguous()
-    boundary_b_t = boundary_b.transpose(1, 2).contiguous()  # (BH, D, N)
-    sign_b_t = sign_b.transpose(1, 2).contiguous()
-
-    cum_indicator, k_table = _get_cached_enable_tables(
-        config, sc_prec, device, rand_seqs_a_t, rand_seqs_b_t, stoc_len)
-    V_actual = cum_indicator.shape[2]
-
-    head_scale_ones = torch.ones(BH, dtype=torch.float32, device=device)
-    output = torch.empty(BH, M, N, dtype=torch.float32, device=device)
-
-    BLOCK_M, BLOCK_N, BLOCK_K, nw = _pick_enable_block_sizes(M, N, D)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), BH)
-    # Kernel's (N, M) = (rows of A, rows of B) = our (M, N).
-    enable_matmul_bipolar_batched_kernel[grid](
-        cum_indicator, k_table,
-        boundary_a_t, boundary_b_t,
-        sign_a_t, sign_b_t,
-        output, head_scale_ones,
-        M, N, D,
-        stoc_len, V_actual, q_max_sq,
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        num_warps=nw,
+    result = _sc_matmul_unipolar_grouped(
+        a, b, group_a, group_b, sc_prec,
+        rand_seqs_a_t, rand_seqs_b_t, N, D, M, stoc_len,
     )
 
-    output.mul_(scale_a_row.unsqueeze(2) * scale_b_row.unsqueeze(1))
+    if device.type != 'cuda':
+        result = result.to(device)
+
+    return result
+
+
+def _sc_matmul_batched(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    max_fp_a: float,
+    min_fp_a: float,
+    max_fp_b: float,
+    min_fp_b: float,
+    mode: str,
+    sc_prec: int,
+    config: Optional[dict],
+) -> torch.Tensor:
+    """
+    Batched SC matrix multiplication using CUDA streams for parallelism.
+
+    Args:
+        a: (B, N, D) tensor
+        b: (B, M, D) tensor
+
+    Returns:
+        (B, N, M) tensor
+    """
+    B, N, D = a.shape
+    M = b.shape[1]
+    output = torch.empty(B, N, M, dtype=torch.float32, device=a.device)
+
+    # Use CUDA streams for parallel execution across batch
+    streams = [torch.cuda.Stream() for _ in range(B)]
+    for i in range(B):
+        with torch.cuda.stream(streams[i]):
+            output[i] = sc_matmul(a[i], b[i], max_fp_a, min_fp_a,
+                                   max_fp_b, min_fp_b, mode, sc_prec, config)
+    # Sync all streams
+    for s in streams:
+        s.synchronize()
     return output
+
+
+# =============================================================================
+# Drop-in replacement API (legacy, for testing/benchmarking)
+# =============================================================================
+
+def matmul_sc_triton(
+    Q_l: int,
+    Q_e: int,
+    K_l: int,
+    K_e: int,
+    config: Optional[dict] = None,
+    binary_prec: str = "fp8_e4m3",
+    sc_prec: int = 8,
+    input_seed: Optional[int] = None,
+    verbose: bool = False,
+):
+    """
+    Perform matrix multiplication using stochastic computing on GPU.
+
+    This is a drop-in replacement for matmul_sc() in sc.py.
+
+    Args:
+        Q_l: Token length of Q
+        Q_e: Embedding dimension of Q
+        K_l: Token length of K
+        K_e: Embedding dimension of K
+        config: RNG/SNG configuration dict with structure:
+            {
+                "rng_pool": [
+                    {"type": "lfsr", "seed": 125, "taps": [7,5,3,0]},
+                    {"type": "sobol", "seed_type": "q"},
+                    ...
+                ],
+                "sng": {
+                    "q": [{"rng_id": 0, "scramble": None}, ...],
+                    "k": [{"rng_id": 1, "scramble": [7,6,5,4,3,2,1,0]}, ...],
+                }
+            }
+        binary_prec: Precision for binary representation. Options:
+            - "fp8_e4m3": FP8 E4M3 format, max=448 (default)
+            - "fp8_e5m2": FP8 E5M2 format, max=57344
+            - "int8": Signed 8-bit integer, max=127
+        sc_prec: Precision for stochastic computing (default is 8)
+        input_seed: Numpy random seed for reproducible Q/K generation
+        verbose: Enable debug prints (default is False)
+
+    Returns:
+        A tuple containing:
+        - QK_sc: SC-computed QK matrix (numpy array)
+        - QK_actual: Actual QK matrix (ground truth, numpy array)
+        - rmse: RMSE on normalized values (comparable across precisions)
+    """
+    assert Q_e == K_e, "Embedding dimensions must match for Q @ K^T"
+
+    # Set seed for reproducibility
+    if input_seed is not None:
+        np.random.seed(input_seed)
+
+    # Get max value based on precision
+    if binary_prec == "fp8_e4m3":
+        max_val = FP8_E4M3_MAX
+    elif binary_prec == "fp8_e5m2":
+        max_val = FP8_E5M2_MAX
+    elif binary_prec == "int8":
+        max_val = INT8_MAX
+    else:
+        raise ValueError(f"Unsupported binary precision: {binary_prec}")
+
+    # Generate random Q and K matrices
+    if binary_prec == "int8":
+        Q_np = np.random.randint(-max_val, max_val + 1, size=(Q_l, Q_e)).astype(np.float32)
+        K_np = np.random.randint(-max_val, max_val + 1, size=(K_l, K_e)).astype(np.float32)
+    else:
+        Q_np = np.random.uniform(-max_val, max_val, size=(Q_l, Q_e)).astype(np.float32)
+        K_np = np.random.uniform(-max_val, max_val, size=(K_l, K_e)).astype(np.float32)
+
+    # Compute actual matrix multiplication: Q @ K^T -> (Q_l, K_l)
+    QK_actual = Q_np @ K_np.T
+
+    # Stochastic computing parameters
+    stoc_len = 2 ** sc_prec
+
+    # Use default config if not provided
+    if config is None:
+        from config_helpers import make_default_config
+        config = make_default_config(Q_e, K_e, sc_prec)
+
+    # Build RNG pool and SNG banks
+    rng_pool = RNGPool(config["rng_pool"], sc_prec)
+    sng_q = SNGBank(rng_pool, config["sng"]["q"])
+    sng_k = SNGBank(rng_pool, config["sng"]["k"])
+
+    # Get all per-element random sequences (with scrambling already applied)
+    rand_seqs_q = sng_q.get_all_sequences(stoc_len)  # (Q_e, stoc_len)
+    rand_seqs_k = sng_k.get_all_sequences(stoc_len)  # (K_e, stoc_len)
+
+    if verbose:
+        print(f"Q[0,:3] = {Q_np[0, :3]}")
+        print(f"K[0,:3] = {K_np[0, :3]}")
+        print(f"stoc_len = {stoc_len}, max_rng_val = {2**sc_prec - 1}")
+        print(f"RNG pool size: {len(rng_pool)}")
+        print(f"Q SNGs: {len(sng_q)}, K SNGs: {len(sng_k)}")
+
+    # Transfer to GPU
+    device = 'cuda'
+    Q = torch.from_numpy(Q_np).to(device)
+    K = torch.from_numpy(K_np).to(device)
+    rand_seqs_q_t = torch.tensor(rand_seqs_q, dtype=torch.int32, device=device)
+    rand_seqs_k_t = torch.tensor(rand_seqs_k, dtype=torch.int32, device=device)
+
+    # Phase 1: Convert to packed stochastic streams
+    Q_packed = bin_to_stoc_packed(Q, rand_seqs_q_t, max_val, sc_prec)
+    K_packed = bin_to_stoc_packed(K, rand_seqs_k_t, max_val, sc_prec)
+
+    # Phase 2: XNOR matrix multiplication
+    max_val_squared = float(max_val * max_val)
+    QK_sc_t = xnor_matmul(Q_packed, K_packed, Q_l, Q_e, K_l, stoc_len, max_val_squared)
+
+    # Transfer back to CPU
+    QK_sc = QK_sc_t.cpu().numpy()
+
+    if verbose:
+        print(f"\nTriton SC result sample: {QK_sc[0, :3]}")
+        print(f"Actual result sample: {QK_actual[0, :3]}")
+
+    # Compute RMSE on normalized values (standard in SC papers)
+    max_dot_product = Q_e * (max_val ** 2)
+    QK_sc_norm = QK_sc / max_dot_product
+    QK_actual_norm = QK_actual / max_dot_product
+    rmse = np.sqrt(np.mean((QK_sc_norm - QK_actual_norm) ** 2))
+
+    return QK_sc, QK_actual, rmse
+
+# OUTDATED
+def matmul_sc_triton_from_saved(
+    Q_l: int,
+    Q_e: int,
+    K_l: int,
+    K_e: int,
+    operation: str = "matmul",
+    sc_prec: int = 8,
+    binary_prec: str = "int8",
+    config_path: Optional[str] = None,
+    input_seed: Optional[int] = None,
+    verbose: bool = False,
+):
+    """
+    Load best saved config and run SC matmul on GPU.
+
+    Args:
+        Q_l, Q_e, K_l, K_e: Matrix dimensions
+        operation: Operation type for config lookup (default: "matmul")
+        sc_prec: SC precision for config lookup (default: 8)
+        binary_prec: Binary precision for config lookup (default: "int8")
+        config_path: Direct path to config file (overrides lookup)
+        input_seed: Numpy random seed for reproducibility
+        verbose: Enable debug prints
+
+    Returns:
+        Tuple of (QK_sc, QK_actual, rmse) or None if no config found
+    """
+    from config_helpers import load_config, load_best_config
+
+    if config_path:
+        config, metadata = load_config(config_path)
+    else:
+        config, metadata = load_best_config(operation, sc_prec, binary_prec)
+
+    if config is None:
+        if verbose:
+            print(f"No saved config found for {operation}/{sc_prec}bit/{binary_prec}")
+        return None
+
+    if verbose and metadata:
+        print(f"Loaded config with error: {metadata.get('error', 'N/A')}")
+
+    return matmul_sc_triton(
+        Q_l, Q_e, K_l, K_e,
+        config=config,
+        binary_prec=binary_prec,
+        sc_prec=sc_prec,
+        input_seed=input_seed,
+        verbose=verbose,
+    )
+
+
+# =============================================================================
+# Test and Benchmark
+# =============================================================================
+
+def test_all_configs():
+    """Test GPU implementation against CPU for all config types."""
+    from sc import matmul_sc
+    from config_helpers import (
+        make_default_config, make_random_config,
+        make_fully_independent_config, make_sobol_simple_config,make_sobol_dse_config,
+    )
+
+    print("Testing GPU vs CPU for all config types...")
+    print("=" * 60)
+
+    configs = [
+        ("default (shared RNG + reverse)", make_default_config(64, 64, 8)),
+        ("two_rng (Q->RNG0, K->RNG1)", make_random_config(64, 64, 8)),
+        ("fully_independent", make_fully_independent_config(64, 64, 8)),
+        ("sobol_simple", make_sobol_simple_config(64, 64, 8)),
+        ("sobol_dse", make_sobol_dse_config(64, 64, 8)),
+    ]
+
+    all_passed = True
+    for name, config in configs:
+        # Run both with same seed
+        _, _, rmse_cpu = matmul_sc(4, 64, 4, 64, config=config, input_seed=42)
+        _, _, rmse_gpu = matmul_sc_triton(4, 64, 4, 64, config=config, input_seed=42)
+
+        diff = abs(rmse_cpu - rmse_gpu)
+        passed = diff < 0.01  # Allow small numerical differences
+        status = "PASS" if passed else "FAIL"
+        all_passed = all_passed and passed
+
+        print(f"  {name}:")
+        print(f"    CPU RMSE: {rmse_cpu:.6f}")
+        print(f"    GPU RMSE: {rmse_gpu:.6f}")
+        print(f"    Diff: {diff:.6f} [{status}]")
+
+    print("=" * 60)
+    print(f"Overall: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
+    return all_passed
+
+
+def benchmark_comparison():
+    """Compare performance: CPU vs GPU across config types."""
+    import time
+    from sc import matmul_sc
+    from config_helpers import (
+        make_default_config, make_random_config,
+        make_fully_independent_config, make_sobol_simple_config, make_sobol_dse_config,
+    )
+
+    print("\nPerformance Benchmark: CPU vs GPU")
+    print("=" * 60)
+
+    Q_l, Q_e, K_l, K_e = 64, 64, 64, 64
+    n_warmup = 3
+    n_runs = 20
+
+    configs = [
+        ("default", make_default_config(Q_e, K_e, 8)),
+        ("two_rng", make_random_config(Q_e, K_e, 8)),
+        ("fully_independent", make_fully_independent_config(Q_e, K_e, 8)),
+        ("sobol_simple", make_sobol_simple_config(Q_e, K_e, 8)),
+        ("sobol_dse", make_sobol_dse_config(Q_e, K_e, 8)),
+    ]
+
+    for name, config in configs:
+        # CPU warmup and timing
+        for _ in range(n_warmup):
+            matmul_sc(Q_l, Q_e, K_l, K_e, config=config)
+        t0 = time.time()
+        for _ in range(n_runs):
+            matmul_sc(Q_l, Q_e, K_l, K_e, config=config)
+        cpu_time = (time.time() - t0) / n_runs * 1000  # ms
+
+        # GPU warmup and timing
+        for _ in range(n_warmup):
+            matmul_sc_triton(Q_l, Q_e, K_l, K_e, config=config)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(n_runs):
+            matmul_sc_triton(Q_l, Q_e, K_l, K_e, config=config)
+        torch.cuda.synchronize()
+        gpu_time = (time.time() - t0) / n_runs * 1000  # ms
+
+        speedup = cpu_time / gpu_time if gpu_time > 0 else float('inf')
+        print(f"  {name}:")
+        print(f"    CPU: {cpu_time:.2f} ms")
+        print(f"    GPU: {gpu_time:.2f} ms")
+        print(f"    Speedup: {speedup:.1f}x")
+
+    print("=" * 60)
+
+
+def test_sc_matmul():
+    """Test the new sc_matmul() FP-in/FP-out entry point."""
+    from config_helpers import make_sobol_simple_config
+
+    print("Testing sc_matmul() FP-in/FP-out entry point...")
+    print("=" * 60)
+
+    N, D, M = 8, 64, 8
+    config = make_sobol_simple_config(D, D, 8)
+
+    # --- Test bipolar mode ---
+    print("\n  Bipolar mode (symmetric, XNOR):")
+    torch.manual_seed(42)
+    a = torch.randn(N, D, device='cuda') * 3.0  # FP values in ~ [-9, 9]
+    b = torch.randn(M, D, device='cuda') * 3.0
+
+    max_fp = max(a.abs().max().item(), b.abs().max().item())
+    result_sc = sc_matmul(a, b, max_fp, -max_fp, mode="bipolar", sc_prec=8, config=config)
+    result_gt = a @ b.T
+
+    # Compute RMSE normalized by max possible dot product
+    max_dot = D * max_fp * max_fp
+    rmse = ((result_sc - result_gt) ** 2).mean().sqrt().item() / max_dot
+    print(f"    RMSE (normalized): {rmse:.6f}")
+    print(f"    SC sample:  {result_sc[0, :3].tolist()}")
+    print(f"    GT sample:  {result_gt[0, :3].tolist()}")
+    bipolar_pass = rmse < 0.05
+    print(f"    [{('PASS' if bipolar_pass else 'FAIL')}]")
+
+    # --- Test unipolar mode ---
+    print("\n  Unipolar mode (asymmetric, AND):")
+    torch.manual_seed(42)
+    # Post-softmax-like values in [0, 1]
+    a_uni = torch.rand(N, D, device='cuda')
+    b_uni = torch.rand(M, D, device='cuda')
+
+    result_sc_uni = sc_matmul(a_uni, b_uni, 1.0, 0.0, mode="unipolar", sc_prec=8, config=config)
+    result_gt_uni = a_uni @ b_uni.T
+
+    max_dot_uni = D * 1.0 * 1.0
+    rmse_uni = ((result_sc_uni - result_gt_uni) ** 2).mean().sqrt().item() / max_dot_uni
+    print(f"    RMSE (normalized): {rmse_uni:.6f}")
+    print(f"    SC sample:  {result_sc_uni[0, :3].tolist()}")
+    print(f"    GT sample:  {result_gt_uni[0, :3].tolist()}")
+    unipolar_pass = rmse_uni < 0.05
+    print(f"    [{('PASS' if unipolar_pass else 'FAIL')}]")
+
+    # --- Test batched ---
+    print("\n  Batched bipolar mode (B=4):")
+    a_batch = torch.randn(4, N, D, device='cuda') * 2.0
+    b_batch = torch.randn(4, M, D, device='cuda') * 2.0
+    max_fp_b = max(a_batch.abs().max().item(), b_batch.abs().max().item())
+
+    result_sc_b = sc_matmul(a_batch, b_batch, max_fp_b, -max_fp_b, mode="bipolar", sc_prec=8, config=config)
+    result_gt_b = torch.bmm(a_batch, b_batch.transpose(-2, -1))
+
+    max_dot_b = D * max_fp_b * max_fp_b
+    rmse_b = ((result_sc_b - result_gt_b) ** 2).mean().sqrt().item() / max_dot_b
+    print(f"    RMSE (normalized): {rmse_b:.6f}")
+    batch_pass = rmse_b < 0.05
+    print(f"    [{('PASS' if batch_pass else 'FAIL')}]")
+
+    print("=" * 60)
+    all_pass = bipolar_pass and unipolar_pass and batch_pass
+    print(f"sc_matmul: {'ALL PASSED' if all_pass else 'SOME FAILED'}")
+    return all_pass
+
+
+if __name__ == "__main__":
+    print("Testing Triton SC Matrix Multiplication...")
+    print("=" * 60)
+
+    # Basic test (legacy API)
+    print("\nBasic test (4x64 @ 4x64):")
+    QK_sc, QK_actual, rmse = matmul_sc_triton(4, 64, 4, 64, verbose=True, sc_prec=8)
+    print(f"\nRMSE: {rmse:.6f}")
+
+    # Test all config types (legacy API)
+    print("\n")
+    test_all_configs()
+
+    # Test new sc_matmul entry point
+    print("\n")
+    test_sc_matmul()
+
+    # Benchmark
+    benchmark_comparison()
