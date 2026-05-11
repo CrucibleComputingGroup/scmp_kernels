@@ -1,15 +1,21 @@
 # scmp_kernels
 
-Shared stochastic-computing kernels and mixed-precision dispatch, factored out of `scmp_llm` and `vit_sc`.
+Shared stochastic-computing kernels and mixed-precision dispatch.
 
 ## Layout
 
 ```
 scmp_kernels/
-├── sc/             # Stochastic-computing kernels (Triton)        ← migrated
-├── mp/             # Mixed-precision dispatch + config             (placeholder)
-├── qwt/            # QwT compensation                              (placeholder)
-└── sensitivity/    # Per-(op, block) sensitivity tools             (placeholder)
+├── scmp_kernels/
+│   ├── sc/             # Stochastic-computing kernels (Triton)
+│   ├── mp/             # Mixed-precision dispatch + config
+│   ├── qwt/            # QwT compensation                       (placeholder)
+│   └── sensitivity/    # Per-(op, block) sensitivity tools      (placeholder)
+├── application/
+│   ├── Diffusion/      # Q-DiT integration (active)
+│   ├── ViT/            # placeholder
+│   └── WorldModel/     # placeholder
+└── tests/
 ```
 
 ## SC quickstart
@@ -51,6 +57,16 @@ sc_matmul(a, b,
 
 `chunk_d > 0` requires `granularity="per_row"` and `mode="bipolar"`. Other combinations raise `ValueError`.
 
-## MP / QwT / Sensitivity
+## MP quickstart
 
-Not yet migrated. The empty `mp/`, `qwt/`, `sensitivity/` packages reserve the namespace.
+```python
+from scmp_kernels.mp import (
+    AdaptiveMPConfig,
+    classify_rows_by_metric,
+    adaptive_classify_rows,
+    MPDistributionLogger,
+    MetricProfiler,
+)
+```
+
+`qwt/` and `sensitivity/` are placeholders reserving the namespace.

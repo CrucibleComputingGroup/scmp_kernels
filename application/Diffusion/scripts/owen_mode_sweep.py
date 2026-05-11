@@ -5,15 +5,8 @@ Reuses the shapes from debug_fixed_level_sanity.py (linear / av / qk).
 Prints a table per op so you can A/B the modes at a glance.
 """
 import os
-import sys
-from pathlib import Path
 
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SC_ROOT = REPO_ROOT / "SC"
-if str(SC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SC_ROOT))
 
 
 LEVELS = [16, 32, 48, 64, 96, 128]

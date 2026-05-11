@@ -28,7 +28,6 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / "SC"))
 
 from qdit.sc_integration.noise_matmul import (
     noisy_sc_matmul,

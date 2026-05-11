@@ -1,9 +1,8 @@
 """Smoke tests for scmp_kernels.sc — verify imports succeed and the unified
 sc_matmul dispatches correctly for each granularity.
 
-The numerical correctness is checked by the in-repo SC benchmarks
-(scmp_llm/SC/bench_table_vs_compact.py, vit_sc cls/det evaluations).
-Here we only verify:
+Numerical correctness is checked by downstream application benchmarks
+(see application/Diffusion). Here we only verify:
 
   1. The package imports cleanly.
   2. ``sc_matmul`` runs on CUDA for each granularity and returns the

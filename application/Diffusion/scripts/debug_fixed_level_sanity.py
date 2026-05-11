@@ -1,13 +1,4 @@
-import sys
-from pathlib import Path
-
 import torch
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SC_ROOT = REPO_ROOT / "SC"
-if str(SC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SC_ROOT))
 
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 from scmp_kernels.sc.sc_triton import (

@@ -6,16 +6,9 @@ particular seed. Run 5 different mask-seeds and check variance.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SC_ROOT = REPO_ROOT / "SC"
-sys.path.insert(0, str(SC_ROOT))
-
-import sc_triton
+from scmp_kernels.sc import sc_triton
 from scmp_kernels.sc.sc_triton import (
     clear_rng_cache,
     sc_matmul_enable_batched_bipolar,

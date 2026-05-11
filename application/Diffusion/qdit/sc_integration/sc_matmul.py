@@ -6,19 +6,10 @@ multiplication, adapting the SC triton kernels for use with PyTorch tensors
 in the diffusion transformer.
 """
 
-import sys
-from pathlib import Path
-
 import torch
 import numpy as np
 from typing import Optional, Tuple
 
-# Add SC folder to path for imports
-SC_PATH = Path(__file__).parent.parent.parent.parent / "SC"
-if str(SC_PATH) not in sys.path:
-    sys.path.insert(0, str(SC_PATH))
-
-# Import SC components
 from scmp_kernels.sc.sc_triton import bin_to_stoc_packed, xnor_matmul
 from scmp_kernels.sc.sng import RNGPool, SNGBank
 from scmp_kernels.sc.config_helpers import make_sobol_simple_config

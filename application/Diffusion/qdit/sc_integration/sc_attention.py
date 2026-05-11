@@ -12,10 +12,8 @@ stoc_len for early-termination speedup.
 from __future__ import annotations
 
 import math
-import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -27,10 +25,6 @@ from ..qLinearLayer import QLinearLayer
 from .sc_controller import SCController
 from .mp_config import classify_rows_by_metric, adaptive_classify_rows, MPDistributionLogger, MetricProfiler
 
-# Add SC folder to path for imports
-SC_PATH = Path(__file__).parent.parent.parent.parent / "SC"
-if str(SC_PATH) not in sys.path:
-    sys.path.insert(0, str(SC_PATH))
 from scmp_kernels.sc.sc_triton import (sc_matmul, sc_matmul_grouped, sc_matmul_enable_triton,
                        sc_matmul_grouped_enable_triton, sc_matmul_enable_batched_bipolar,
                        sc_matmul_mlp, sc_matmul_enable_triton_mlp)
