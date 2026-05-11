@@ -36,13 +36,13 @@ from qdit.sc_integration.noise_matmul import (
     noisy_sc_matmul_grouped,
     noisy_sc_matmul_enable_batched_bipolar,
 )
-from sc_triton import (
+from scmp_kernels.sc.sc_triton import (
     sc_matmul_enable_triton,
     sc_matmul_enable_triton_mlp,
     sc_matmul_grouped_enable_triton,
     sc_matmul_enable_batched_bipolar,
 )
-from config_helpers import make_sobol_simple_config
+from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

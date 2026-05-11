@@ -19,9 +19,9 @@ if str(SC_PATH) not in sys.path:
     sys.path.insert(0, str(SC_PATH))
 
 # Import SC components
-from sc_triton import bin_to_stoc_packed, xnor_matmul
-from sng import RNGPool, SNGBank
-from config_helpers import make_sobol_simple_config
+from scmp_kernels.sc.sc_triton import bin_to_stoc_packed, xnor_matmul
+from scmp_kernels.sc.sng import RNGPool, SNGBank
+from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
 def sc_matmul_qk(

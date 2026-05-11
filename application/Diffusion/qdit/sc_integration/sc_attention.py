@@ -31,10 +31,10 @@ from .mp_config import classify_rows_by_metric, adaptive_classify_rows, MPDistri
 SC_PATH = Path(__file__).parent.parent.parent.parent / "SC"
 if str(SC_PATH) not in sys.path:
     sys.path.insert(0, str(SC_PATH))
-from sc_triton import (sc_matmul, sc_matmul_grouped, sc_matmul_enable_triton,
+from scmp_kernels.sc.sc_triton import (sc_matmul, sc_matmul_grouped, sc_matmul_enable_triton,
                        sc_matmul_grouped_enable_triton, sc_matmul_enable_batched_bipolar,
                        sc_matmul_mlp, sc_matmul_enable_triton_mlp)
-from config_helpers import make_sobol_simple_config
+from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
 @dataclass

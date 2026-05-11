@@ -16,13 +16,13 @@ SC_ROOT = REPO_ROOT / "SC"
 sys.path.insert(0, str(SC_ROOT))
 
 import sc_triton
-from sc_triton import (
+from scmp_kernels.sc.sc_triton import (
     clear_rng_cache,
     sc_matmul_enable_batched_bipolar,
     sc_matmul_enable_triton,
     sc_matmul_grouped_enable_triton,
 )
-from config_helpers import make_sobol_simple_config
+from scmp_kernels.sc.config_helpers import make_sobol_simple_config
 
 
 def rel_err(pred, target):

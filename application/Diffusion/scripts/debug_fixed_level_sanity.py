@@ -9,8 +9,8 @@ SC_ROOT = REPO_ROOT / "SC"
 if str(SC_ROOT) not in sys.path:
     sys.path.insert(0, str(SC_ROOT))
 
-from config_helpers import make_sobol_simple_config
-from sc_triton import (
+from scmp_kernels.sc.config_helpers import make_sobol_simple_config
+from scmp_kernels.sc.sc_triton import (
     sc_matmul_enable_batched_bipolar,
     sc_matmul_enable_triton,
     sc_matmul_grouped_enable_triton,
