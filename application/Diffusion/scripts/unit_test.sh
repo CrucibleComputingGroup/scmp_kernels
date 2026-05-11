@@ -1,0 +1,1 @@
+python scripts/quant_sc_main.py     --wbits 8 --abits 8 --w_sym --a_sym     --timewise 0.5     --qklayerwise 0.8 --avlayerwise 0.0 --projlayerwise 0.0     --mlplayerwise 0.0 --inputprojlayerwise 0.0     --sc_prec 8     --image-size 256 --num-sampling-steps 100 --batch-size 16 --sc_enable

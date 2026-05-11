@@ -1,0 +1,152 @@
+#!/bin/bash
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --reservation=rtx6000_arph_nodes
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-gpu=8
+#SBATCH --mem=256G
+#SBATCH --time=14-00:00:00
+#SBATCH --signal=B:TERM@300
+#
+# Uniform-budget FID-10k on 4 GPUs in one node, work-steal layout.
+# Resumable: re-`sbatch` after wall-time; planner skips on-disk indices and
+# only schedules the still-missing ones, redivided across NUM_GPUS.
+#
+# Required (pass via --export=ALL,SC_BUDGET=48):
+#   SC_BUDGET     uniform stoc_len budget (matches results/sc_cfg_uniform${SC_BUDGET}_all.json)
+#
+# Recommended sbatch invocation:
+#   sbatch --job-name=fid_uniform48_bitrev \
+#          --output=/scratch/.../fid_sweep_bitrev/uniform_avg48/slurm-%j.out \
+#          --error=/scratch/.../fid_sweep_bitrev/uniform_avg48/slurm-%j.err \
+#          --export=ALL,SC_BUDGET=48 \
+#          scripts/sbatch_uniform_bitrev_4gpu.sb
+#
+# Optional knobs (override via --export):
+#   NUM_FID=10000 BATCH=32 NUM_STEPS=50 CFG_SCALE=4 NUM_CLASSES=1000
+#   OWEN_MODE=bitrev  NUM_GPUS=4
+
+set -euo pipefail
+
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh
+conda activate qdit
+
+if [[ -z "${SC_BUDGET:-}" ]]; then
+    echo "ERROR: SC_BUDGET is required (pass --export=ALL,SC_BUDGET=48)" >&2
+    exit 2
+fi
+
+NUM_GPUS="${NUM_GPUS:-4}"
+NUM_FID="${NUM_FID:-10000}"
+BATCH="${BATCH:-32}"
+NUM_STEPS="${NUM_STEPS:-50}"
+CFG_SCALE="${CFG_SCALE:-4}"
+NUM_CLASSES="${NUM_CLASSES:-1000}"
+OWEN_MODE="${OWEN_MODE:-bitrev}"
+
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_llm
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_llm
+SC_CONFIG=${REPO}/Q-DiT/results/sc_cfg_uniform${SC_BUDGET}_all.json
+OUT_BASE=${SCRATCH}/fid_sweep_${OWEN_MODE}/uniform_avg${SC_BUDGET}
+SAMPLES=${OUT_BASE}/samples
+IDX_DIR=${OUT_BASE}/_indices
+
+if (( NUM_FID % NUM_CLASSES != 0 )); then
+    echo "ERROR: NUM_FID ($NUM_FID) must be divisible by NUM_CLASSES ($NUM_CLASSES)" >&2
+    exit 1
+fi
+if [[ ! -f "$SC_CONFIG" ]]; then
+    echo "ERROR: missing uniform config: $SC_CONFIG" >&2
+    exit 1
+fi
+
+mkdir -p "$SAMPLES" "$IDX_DIR"
+
+export SC_OWEN_MODE=$OWEN_MODE
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_GPU:-8}
+
+cd "$REPO/Q-DiT"
+
+echo "============================================================"
+echo "fid_uniform${SC_BUDGET}_${OWEN_MODE} sbatch  job=${SLURM_JOB_ID:-local}  start $(date)"
+echo "  host=$(hostname)  gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
+echo "  NUM_GPUS=$NUM_GPUS  NUM_FID=$NUM_FID  BATCH=$BATCH  STEPS=$NUM_STEPS  CFG=$CFG_SCALE"
+echo "  OWEN_MODE=$OWEN_MODE  SC_CONFIG=$SC_CONFIG"
+echo "  OUT_BASE=$OUT_BASE"
+echo "============================================================"
+
+DONE=$(find "$SAMPLES" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9][0-9][0-9].png' 2>/dev/null | wc -l)
+echo "[plan] $DONE/$NUM_FID already on disk"
+if (( DONE >= NUM_FID )); then
+    echo "[done] target already met."
+    exit 0
+fi
+
+python -u scripts/_plan_missing_indices.py \
+    "$SAMPLES" "$NUM_FID" "$NUM_GPUS" "$IDX_DIR" \
+    "$((NUM_FID / NUM_CLASSES))"
+
+# Forward SIGTERM (raised by --signal=B:TERM@300, 5 min before hard kill) to
+# all python workers so each shutdown handler flushes the current batch.
+PIDS=()
+trap '
+echo "[slurm] caught TERM at $(date), forwarding to ${#PIDS[@]} workers";
+for p in "${PIDS[@]}"; do kill -TERM "$p" 2>/dev/null; done
+for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null; done
+' TERM
+
+LAUNCHED=0
+for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
+    INDICES_FILE="${IDX_DIR}/gpu_${GPU_ID}.txt"
+    if [[ ! -s "$INDICES_FILE" ]]; then
+        echo "  [GPU $GPU_ID] no work assigned"
+        continue
+    fi
+    GPU_LOG_DIR="${OUT_BASE}/_logs/gpu_${GPU_ID}"
+    mkdir -p "$GPU_LOG_DIR"
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    SC_OWEN_MODE="$OWEN_MODE" \
+    python -u scripts/quant_sc_main.py \
+        --wbits 8 --abits 8 --w_sym --a_sym \
+        --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 \
+        --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
+        --sc_prec 8 --sc_fixed_level_prec --sc_enable \
+        --sc_config "$SC_CONFIG" \
+        --image-size 256 --num-sampling-steps "$NUM_STEPS" --cfg-scale "$CFG_SCALE" \
+        --batch-size "$BATCH" \
+        --generate-fid-samples \
+        --balanced_classes \
+        --num-classes "$NUM_CLASSES" \
+        --balanced_total_samples "$NUM_FID" \
+        --num-fid-samples "$NUM_FID" \
+        --target_indices_path "$INDICES_FILE" \
+        --samples_dir_override "$SAMPLES" \
+        --seed "$GPU_ID" \
+        --results-dir "$GPU_LOG_DIR" \
+        > "$GPU_LOG_DIR/run.log" 2>&1 &
+    PIDS+=($!)
+    LAUNCHED=$((LAUNCHED + 1))
+    sleep 3   # stagger CUDA init
+done
+
+if (( LAUNCHED == 0 )); then
+    echo "[done] planner produced empty work for all GPUs."
+    exit 0
+fi
+
+FAILED=0
+for i in "${!PIDS[@]}"; do
+    if wait "${PIDS[$i]}"; then
+        echo "  [worker $i] done"
+    else
+        rc=$?
+        echo "  [worker $i] FAILED rc=$rc; see ${OUT_BASE}/_logs/gpu_${i}/run.log"
+        FAILED=$((FAILED + 1))
+    fi
+done
+
+FINAL=$(find "$SAMPLES" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9][0-9][0-9].png' 2>/dev/null | wc -l)
+echo "[end]  $(date)  failed=$FAILED  samples=$FINAL/$NUM_FID"
+if (( FINAL >= NUM_FID )); then exit 0; fi
+exit $(( FAILED > 0 ? 1 : 2 ))

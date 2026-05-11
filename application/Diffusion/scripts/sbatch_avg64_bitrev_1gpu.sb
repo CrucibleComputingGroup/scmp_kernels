@@ -1,0 +1,100 @@
+#!/bin/bash
+#SBATCH --job-name=fid_avg64_bitrev
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --reservation=rtx6000_arph_nodes
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=8
+#SBATCH --mem=64G
+#SBATCH --time=14-00:00:00
+#SBATCH --signal=B:TERM@300
+#SBATCH --output=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_llm/fid_sweep_bitrev/adaptive_avg64/slurm-%j.out
+#SBATCH --error=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_llm/fid_sweep_bitrev/adaptive_avg64/slurm-%j.err
+#
+# adaptive_avg64 FID-10k on a single GPU using the new work-steal layout.
+# Resumable: just `sbatch` the same script again after wall-time expires;
+# the planner skips on-disk indices and only schedules the still-missing ones.
+
+set -euo pipefail
+
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh
+conda activate qdit
+
+# --- knobs (override via --export=ALL,VAR=...) ---
+NUM_FID="${NUM_FID:-10000}"
+BATCH="${BATCH:-32}"
+NUM_STEPS="${NUM_STEPS:-50}"
+CFG_SCALE="${CFG_SCALE:-4}"
+NUM_CLASSES="${NUM_CLASSES:-1000}"
+OWEN_MODE="${OWEN_MODE:-bitrev}"
+
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_llm
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_llm
+CALIB_JSON=${SCRATCH}/calib_sweep_ref256_${OWEN_MODE}/calib_fix_avg64_l256_ref192.json
+OUT_BASE=${SCRATCH}/fid_sweep_${OWEN_MODE}/adaptive_avg64
+SAMPLES=${OUT_BASE}/samples
+IDX_DIR=${OUT_BASE}/_indices
+LOG_DIR=${OUT_BASE}/_logs/gpu_0
+
+mkdir -p "$SAMPLES" "$IDX_DIR" "$LOG_DIR"
+
+export SC_OWEN_MODE=$OWEN_MODE
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_GPU:-8}
+
+cd "$REPO/Q-DiT"
+
+echo "============================================================"
+echo "fid_avg64_bitrev sbatch  job=${SLURM_JOB_ID}  start $(date)"
+echo "  host=$(hostname)  gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+echo "  NUM_FID=$NUM_FID  BATCH=$BATCH  STEPS=$NUM_STEPS  CFG=$CFG_SCALE"
+echo "  OWEN_MODE=$OWEN_MODE  CALIB=$CALIB_JSON"
+echo "  OUT_BASE=$OUT_BASE"
+echo "============================================================"
+
+DONE=$(find "$SAMPLES" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9][0-9][0-9].png' 2>/dev/null | wc -l)
+echo "[plan] $DONE/$NUM_FID already on disk"
+if (( DONE >= NUM_FID )); then
+    echo "[done] target already met."
+    exit 0
+fi
+
+python -u scripts/_plan_missing_indices.py \
+    "$SAMPLES" "$NUM_FID" 1 "$IDX_DIR"
+
+INDICES_FILE=${IDX_DIR}/gpu_0.txt
+if [[ ! -s "$INDICES_FILE" ]]; then
+    echo "[done] planner produced empty list."
+    exit 0
+fi
+
+# Forward SIGTERM (raised by --signal=B:TERM@300, 5 min before hard kill) to
+# python so its shutdown handler flushes the current batch and exits cleanly.
+trap 'echo "[slurm] caught TERM at $(date), forwarding to python"; kill -TERM $PID 2>/dev/null; wait $PID' TERM
+
+python -u scripts/quant_sc_main.py \
+    --wbits 8 --abits 8 --w_sym --a_sym \
+    --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 \
+    --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
+    --sc_prec 8 --sc_fixed_level_prec --sc_enable \
+    --adaptive_mp \
+    --adaptive_mp_table "$CALIB_JSON" \
+    --mp_levels 256,192,128,96,64,48,32,16 \
+    --image-size 256 --num-sampling-steps "$NUM_STEPS" --cfg-scale "$CFG_SCALE" \
+    --batch-size "$BATCH" \
+    --generate-fid-samples \
+    --balanced_classes \
+    --num-classes "$NUM_CLASSES" \
+    --balanced_total_samples "$NUM_FID" \
+    --num-fid-samples "$NUM_FID" \
+    --target_indices_path "$INDICES_FILE" \
+    --samples_dir_override "$SAMPLES" \
+    --seed 0 \
+    --results-dir "$LOG_DIR" &
+PID=$!
+wait $PID
+RC=$?
+
+FINAL=$(find "$SAMPLES" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9][0-9][0-9].png' 2>/dev/null | wc -l)
+echo "[end]  $(date)  rc=$RC  samples=$FINAL/$NUM_FID"
+exit $RC
