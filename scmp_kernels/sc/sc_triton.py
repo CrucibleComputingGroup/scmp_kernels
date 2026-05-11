@@ -1746,7 +1746,7 @@ def fused_quantize_bipolar(
     """
     rows, cols = fp_tensor.shape
     q_norm = 2 ** (sc_prec - 1) - 1     # 127: for SNG boundary normalization
-    q_clip = q_norm - 2                  # 125: quantization range & clamp
+    q_clip = q_norm                      # 127: full range, no clip margin
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
     abs_max = max(abs_max, 1e-5)
     scale = abs_max / q_clip
@@ -3457,9 +3457,9 @@ def _sc_matmul_bipolar(
         dequantize: result_fp = sc_raw * (scale_a * scale_b)
     """
     q_norm = 2 ** (sc_prec - 1) - 1     # 127: for SNG boundary normalization
-    q_clip = q_norm - 2                  # 125: quantization range & clamp
+    q_clip = q_norm                      # 127: full range, no clip margin
 
-    # Per-operand symmetric scales (use q_clip so dequant amplifies to compensate SC)
+    # Per-operand symmetric scales
     abs_max_a = max(abs(max_fp_a), abs(min_fp_a), 1e-5)
     abs_max_b = max(abs(max_fp_b), abs(min_fp_b), 1e-5)
     scale_a = abs_max_a / q_clip
