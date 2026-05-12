@@ -778,10 +778,8 @@ def fused_quant_bipolar_kernel(
     fp_ptr,            # (rows, cols) float32 input
     boundary_ptr,      # (rows, cols) int16 output
     sign_ptr,          # (rows, cols) int8 output
-    inv_scale,         # float: 1.0 / scale = q_norm / abs_max
-    q_clip,            # int: clamp upper bound (e.g. 125 for 8-bit)
-    q_clip_min,        # int: clamp lower bound (e.g. -125 for 8-bit)
-    q_norm,            # int: normalization q_max for boundary (e.g. 127)
+    inv_scale,         # float: 1.0 / scale = q_max / abs_max
+    q_max,             # int: symmetric quantization bound (e.g. 127 for 8-bit)
     max_rng_val,       # int: 2^sc_prec - 1
     rows, cols,
     BLOCK: tl.constexpr,
@@ -790,9 +788,9 @@ def fused_quant_bipolar_kernel(
     Fused bipolar quantization: FP -> (boundary, sign) in one kernel.
 
     For each element x:
-      x_int = round(clamp(x * inv_scale, q_clip_min, q_clip))
+      x_int = round(clamp(x * inv_scale, -q_max, q_max))
       sign = int8(sign(x_int))  (-1, 0, or 1)
-      boundary = int16(abs(x_int) * max_rng_val / q_norm)
+      boundary = int16(abs(x_int) * max_rng_val / q_max)
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
@@ -801,21 +799,17 @@ def fused_quant_bipolar_kernel(
 
     x = tl.load(fp_ptr + offsets, mask=mask, other=0.0)
 
-    # Quantize: x_int = round(clamp(x * inv_scale, q_clip_min, q_clip))
     x_scaled = x * inv_scale
-    # round
     x_rounded = libdevice.nearbyint(x_scaled)
-    # clamp to [-q_clip, q_clip] (narrower than full range to avoid degenerate SC probs)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, q_clip_min.to(tl.float32)), q_clip.to(tl.float32))
+    q_max_f = q_max.to(tl.float32)
+    x_clamped = tl.minimum(tl.maximum(x_rounded, -q_max_f), q_max_f)
 
-    # Sign: -1, 0, or +1 as int8
     sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
                         tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
                                  tl.full(x_clamped.shape, 0, dtype=tl.int8)))
 
-    # Boundary: abs(x_int) * max_rng_val / q_norm (q_norm=127, not q_clip)
     mag = tl.abs(x_clamped)
-    boundary = libdevice.nearbyint(mag * (max_rng_val / q_norm)).to(tl.int16)
+    boundary = libdevice.nearbyint(mag * (max_rng_val / q_max)).to(tl.int16)
 
     tl.store(boundary_ptr + offsets, boundary, mask=mask)
     tl.store(sign_ptr + offsets, sign_val, mask=mask)
@@ -827,8 +821,7 @@ def fused_quant_bipolar_perrow_kernel(
     boundary_ptr,      # (rows, cols) int16 output
     sign_ptr,          # (rows, cols) int8 output
     scale_ptr,         # (rows,) float32 output — per-row scale for dequant
-    q_clip,            # int: clamp bound (e.g. 125)
-    q_norm,            # int: normalization for boundary (e.g. 127)
+    q_max,             # int: symmetric quantization bound (e.g. 127 for 8-bit)
     max_rng_val,       # int: 2^sc_prec - 1
     rows, cols,
     COLS_PAD: tl.constexpr,
@@ -847,29 +840,25 @@ def fused_quant_bipolar_perrow_kernel(
     col_offsets = tl.arange(0, COLS_PAD)
     mask = col_offsets < cols
 
-    # Load entire row
     x = tl.load(fp_ptr + row * cols + col_offsets, mask=mask, other=0.0)
 
-    # Per-row abs max → scale
     abs_max = tl.max(tl.abs(x))
     abs_max = tl.maximum(abs_max, 1e-5)
-    scale = abs_max / q_clip
+    scale = abs_max / q_max
     inv_scale = 1.0 / scale
     tl.store(scale_ptr + row, scale)
 
-    # Quantize: round(clamp(x / scale, -q_clip, q_clip))
     x_scaled = x * inv_scale
     x_rounded = libdevice.nearbyint(x_scaled)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, (-q_clip).to(tl.float32)), q_clip.to(tl.float32))
+    q_max_f = q_max.to(tl.float32)
+    x_clamped = tl.minimum(tl.maximum(x_rounded, -q_max_f), q_max_f)
 
-    # Sign: -1, 0, +1 as int8
     sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
                         tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
                                  tl.full(x_clamped.shape, 0, dtype=tl.int8)))
 
-    # Boundary: round(|x_int| * max_rng_val / q_norm)
     mag = tl.abs(x_clamped)
-    boundary = libdevice.nearbyint(mag * (max_rng_val / q_norm)).to(tl.int16)
+    boundary = libdevice.nearbyint(mag * (max_rng_val / q_max)).to(tl.int16)
 
     tl.store(boundary_ptr + row * cols + col_offsets, boundary, mask=mask)
     tl.store(sign_ptr + row * cols + col_offsets, sign_val, mask=mask)
@@ -883,7 +872,7 @@ def fused_quantize_bipolar_perrow(
     """
     Fused per-row bipolar quantization in one kernel launch.
 
-    Matches _grouped_symmetric_quant(x, G=1, q_max, clip_margin=0) followed by
+    Matches _grouped_symmetric_quant(x, G=1, q_max) followed by
     boundary = (|x_int| * max_rng_val / q_max).round().short().
 
     Returns:
@@ -892,7 +881,7 @@ def fused_quantize_bipolar_perrow(
         scale_row: (rows,) float32 — per-row dequantization scale
     """
     rows, cols = fp_tensor.shape
-    q_max = 2 ** (sc_prec - 1) - 1      # 127: q_clip = q_max (clip_margin=0)
+    q_max = 2 ** (sc_prec - 1) - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
 
     boundary = torch.empty(rows, cols, dtype=torch.int16, device=fp_tensor.device)
@@ -902,7 +891,7 @@ def fused_quantize_bipolar_perrow(
     COLS_PAD = triton.next_power_of_2(cols)
     fused_quant_bipolar_perrow_kernel[(rows,)](
         fp_tensor, boundary, sign, scale_row,
-        q_max, q_max, max_rng_val,
+        q_max, max_rng_val,
         rows, cols, COLS_PAD,
     )
     return boundary, sign, scale_row
@@ -1001,11 +990,10 @@ def fused_quantize_bipolar(
         scale: float (for dequantization)
     """
     rows, cols = fp_tensor.shape
-    q_norm = 2 ** (sc_prec - 1) - 1     # 127: for SNG boundary normalization
-    q_clip = q_norm - 2                  # 125: quantization range & clamp
+    q_max = 2 ** (sc_prec - 1) - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
     abs_max = max(abs_max, 1e-5)
-    scale = abs_max / q_clip
+    scale = abs_max / q_max
     inv_scale = 1.0 / scale
 
     boundary = torch.empty(rows, cols, dtype=torch.int16, device=fp_tensor.device)
@@ -1016,7 +1004,7 @@ def fused_quantize_bipolar(
     grid = (triton.cdiv(total, BLOCK),)
     fused_quant_bipolar_kernel[grid](
         fp_tensor, boundary, sign,
-        inv_scale, q_clip, -q_clip, q_clip, max_rng_val,
+        inv_scale, q_max, max_rng_val,
         rows, cols, BLOCK,
     )
     return boundary, sign, scale
@@ -1042,12 +1030,11 @@ def fused_quantize_unipolar(
     rows, cols = fp_tensor.shape
     q_max = 2 ** sc_prec - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
-    q_lo, q_hi = 2, q_max - 2  # map min->2, max->253 for 8-bit
     range_fp = max(fp_max - fp_min, 1e-5)
-    scale = range_fp / (q_hi - q_lo)
+    scale = range_fp / q_max
     inv_scale = 1.0 / scale
-    zp = round(-fp_min / scale) + q_lo
-    zp = max(q_lo, min(q_hi, zp))
+    zp = round(-fp_min / scale)
+    zp = max(0, min(q_max, zp))
     zp_f = float(zp)
 
     boundary = torch.empty(rows, cols, dtype=torch.int32, device=fp_tensor.device)
@@ -2054,8 +2041,8 @@ def _sc_matmul_enable_triton_bipolar_mlp(
     if group_b <= 0:
         group_b = 1
 
-    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max, clip_margin=0)
-    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max, clip_margin=0)
+    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max)
+    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max)
 
     # Convert quantized integers to boundaries for enable-signal lookup
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
@@ -2497,8 +2484,8 @@ def _sc_matmul_bipolar_grouped_enable(
     q_max = 2 ** (sc_prec - 1) - 1
 
     # Per-row-group symmetric quantization
-    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max, clip_margin=0)
-    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max, clip_margin=0)
+    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max)
+    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max)
 
     # Compute boundaries for enable-signal lookup
     abs_a_int = a_int.abs()
@@ -2578,16 +2565,13 @@ def _sc_matmul_unipolar_grouped_enable(
     return result_fp
 
 
-def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
+def _grouped_symmetric_quant(x, G, q_max):
     """Per-row-group symmetric quantization for bipolar mode.
 
     Args:
         x: (rows, cols) float tensor
         G: number of rows per quantization group
         q_max: max quantized value (e.g. 127 for 8-bit bipolar)
-        clip_margin: headroom levels for outliers (default 2).
-                     scale uses q_max - clip_margin, clamp uses q_max.
-                     Set to 0 to disable clipping (standard quantization).
 
     Returns:
         scale_row: (rows,) per-row scale
@@ -2595,12 +2579,11 @@ def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
         sign:      (rows, cols) sign bits (+1/-1)
     """
     rows, cols = x.shape
-    q_clip = q_max - clip_margin
 
     if G >= rows:
         # Single group (per-tensor) — fast path
         abs_max = x.abs().max().clamp(min=1e-5)
-        scale = abs_max / q_clip  # use q_clip so dequant amplifies
+        scale = abs_max / q_max
         x_int = (x / scale).round().clamp(-q_max, q_max)
         sign = torch.sign(x_int).to(torch.int8)
         sign[sign == 0] = 1  # Handle zeros as positive
@@ -2616,7 +2599,7 @@ def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
     if num_full > 0:
         x_full = x[:num_full * G].reshape(num_full, G, cols)
         gabs_max = x_full.abs().amax(dim=(1, 2)).clamp(min=1e-5)  # (num_full,)
-        gscale = gabs_max / q_clip  # use q_clip so dequant amplifies
+        gscale = gabs_max / q_max
 
         # Expand scales for broadcasting
         gscale_exp = gscale[:, None, None].expand(num_full, G, cols)
@@ -2631,7 +2614,7 @@ def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
     if rem > 0:
         x_rem = x[num_full * G:]
         rabs_max = x_rem.abs().max().clamp(min=1e-5)
-        rscale = rabs_max / q_clip  # use q_clip so dequant amplifies
+        rscale = rabs_max / q_max
         x_rem_quant = (x_rem / rscale).round().clamp(-q_max, q_max)
         x_rem_sign = torch.sign(x_rem_quant).to(torch.int8)
         x_rem_sign[x_rem_sign == 0] = 1
@@ -2762,7 +2745,7 @@ def _pick_enable_block_sizes(rows_a: int, rows_b: int, D: int) -> tuple:
 # Ported from vit_sc/sc/sc_triton.py.
 # =============================================================================
 
-def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
+def _grouped_symmetric_quant_batched(x, G, q_max):
     """Batched per-row-group symmetric quant. ``x`` is (BH, rows, cols).
 
     Currently only ``G == 1`` (per-row) and ``G >= rows`` (per-batch-tensor)
@@ -2770,11 +2753,10 @@ def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
     """
     assert x.dim() == 3, f"expected (BH, rows, cols), got {tuple(x.shape)}"
     BH, rows, cols = x.shape
-    q_clip = q_max - clip_margin
 
     if G >= rows:
         abs_max = x.abs().amax(dim=(1, 2)).clamp(min=1e-5)        # (BH,)
-        scale = abs_max / q_clip                                    # (BH,)
+        scale = abs_max / q_max                                    # (BH,)
         x_int = (x / scale[:, None, None]).round().clamp(-q_max, q_max)
         sign = torch.sign(x_int).to(torch.int8)
         sign = torch.where(sign == 0, torch.ones_like(sign), sign)
@@ -2782,7 +2764,7 @@ def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
 
     if G == 1:
         abs_max = x.abs().amax(dim=2).clamp(min=1e-5)               # (BH, rows)
-        scale = abs_max / q_clip                                    # (BH, rows)
+        scale = abs_max / q_max                                    # (BH, rows)
         x_int = (x / scale[:, :, None]).round().clamp(-q_max, q_max)
         sign = torch.sign(x_int).to(torch.int8)
         sign = torch.where(sign == 0, torch.ones_like(sign), sign)
@@ -2876,9 +2858,9 @@ def _sc_matmul_per_row_batched(
     q_max_sq = float(q_max * q_max)
 
     scale_a_row, a_int, sign_a = _grouped_symmetric_quant_batched(
-        a, group_a, q_max, clip_margin=0)         # scale (BH, M); a_int/sign (BH, M, D)
+        a, group_a, q_max)                         # scale (BH, M); a_int/sign (BH, M, D)
     scale_b_row, b_int, sign_b = _grouped_symmetric_quant_batched(
-        b, group_b, q_max, clip_margin=0)         # scale (BH, N); b_int/sign (BH, N, D)
+        b, group_b, q_max)                         # scale (BH, N); b_int/sign (BH, N, D)
 
     boundary_a = (a_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, M, D)
     boundary_b = (b_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, N, D)
