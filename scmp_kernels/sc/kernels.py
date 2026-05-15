@@ -477,7 +477,7 @@ def fused_quantize_unipolar(
     sc_prec: int,
     compute_sum: bool = False,
     rng_levels: Optional[int] = None,
-) -> tuple[torch.Tensor, float, float, float, torch.Tensor | None]:
+) -> tuple[torch.Tensor, float, float, torch.Tensor | None]:
     """Fused unipolar quantization. Returns (boundary int32, scale, zp, row_sum-or-None)."""
     rows, cols = fp_tensor.shape
     q_max = 2 ** sc_prec - 1
