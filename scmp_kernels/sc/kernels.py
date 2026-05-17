@@ -401,7 +401,9 @@ def fused_quant_kernel(
         boundary = libdevice.nearbyint(x_clamped * (max_rng_val / q_max)).to(tl.int32)
         if PER_ROW:
             tl.store(boundary_ptr + base + col_offsets, boundary, mask=mask)
-            row_sum = tl.sum(x_clamped, axis=0)
+            # Mask out padded lanes: with other=0.0 load, padded x_scaled = zp,
+            # so unmasked x_clamped lanes would each add zp to row_sum.
+            row_sum = tl.sum(tl.where(mask, x_clamped, 0.0), axis=0)
             tl.store(row_sum_ptr + row, row_sum)
         else:
             tl.store(boundary_ptr + col_offsets, boundary, mask=mask)
