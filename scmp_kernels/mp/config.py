@@ -702,13 +702,20 @@ def classify_groups_by_range(
 
     Args:
         weight: [out_features, in_features] weight tensor (already quantized).
-        group_size: Number of output rows per group. Use 0 or out_features
-            for per-row grouping.
+        group_size: Number of output rows per group.
+
+            * ``1``  selects true per-row grouping (``num_groups == out_features``).
+            * Values ``<= 0`` or ``>= out_features`` collapse to a single
+              per-tensor group (``num_groups == 1``) — one ``stoc_len`` for
+              the whole weight matrix.
+            * Any other value ``g`` produces ``out_features // g`` groups and
+              currently requires ``out_features % g == 0`` (the reshape below
+              will raise otherwise).
         config: RangeMPConfig instance.
         operator: Operator name for per-op threshold lookup.
 
     Returns:
-        List of stoc_len values, one per group.
+        List of stoc_len values, one per group (length ``num_groups``).
     """
     out_features, in_features = weight.shape
     if group_size <= 0 or group_size >= out_features:
