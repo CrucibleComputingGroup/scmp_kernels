@@ -33,13 +33,15 @@ class MPConfig:
         if self.level_fractions is None:
             n = len(self.stoc_len_levels)
             self.level_fractions = [1.0 / n] * n
-        assert len(self.level_fractions) == len(self.stoc_len_levels), (
-            f"level_fractions length ({len(self.level_fractions)}) must match "
-            f"stoc_len_levels length ({len(self.stoc_len_levels)})"
-        )
-        assert abs(sum(self.level_fractions) - 1.0) < 1e-6, (
-            f"level_fractions must sum to 1.0, got {sum(self.level_fractions)}"
-        )
+        if len(self.level_fractions) != len(self.stoc_len_levels):
+            raise ValueError(
+                f"level_fractions length ({len(self.level_fractions)}) must match "
+                f"stoc_len_levels length ({len(self.stoc_len_levels)})"
+            )
+        if abs(sum(self.level_fractions) - 1.0) >= 1e-6:
+            raise ValueError(
+                f"level_fractions must sum to 1.0, got {sum(self.level_fractions)}"
+            )
 
 
 @dataclass
@@ -159,6 +161,10 @@ def classify_rows_by_metric(
             count = round(frac * N)
         else:
             count = N - offset
+        # Clamp to remaining rows: cumulative round() on small N + many
+        # levels can otherwise drive the final count negative, or have
+        # earlier levels overrun N and leave later levels with no rows.
+        count = max(0, min(count, N - offset))
         rows = sorted_indices[offset:offset + count]
         row_levels[rows] = i
         level_row_indices[sl] = rows
