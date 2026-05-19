@@ -905,15 +905,12 @@ def _prepare_rng_prefix(
     """Slice and, if needed, rescale RNG integers onto a smaller enable grid."""
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
     base_levels = 2 ** sc_prec
-    is_prefix = stoc_len < rng.shape[1]
-    prefix = rng[:, :stoc_len].contiguous() if is_prefix else rng
+    prefix = rng[:, :stoc_len].contiguous() if stoc_len < rng.shape[1] else rng
     if grid_levels == base_levels:
-        # Fixed-level path: if we're truncating a longer Sobol sequence, apply
-        # Owen scramble to break the prefix stratification artifact. When the
-        # sequence is used in full (non-truncated), no scramble is needed.
-        if is_prefix:
-            return _owen_scramble(prefix, base_levels)
-        return prefix
+        # Per-dim Owen XOR — even at full length, this decorrelates the joint
+        # (rng_a, rng_b) trajectory across dimensions; without it, all D dims
+        # share the same joint, and SC noise accumulates instead of averaging.
+        return _owen_scramble(prefix, base_levels)
 
     prefix_i64 = prefix.to(torch.int64)
     scaled = torch.div(prefix_i64 * grid_levels, base_levels, rounding_mode="floor")
