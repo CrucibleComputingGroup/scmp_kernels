@@ -25,6 +25,7 @@ from .kernels import (
     _sc_matmul_per_row_batched,
     _sc_matmul_per_head_bipolar,
 )
+from ..quant.smoothquant import apply_smoothing
 
 
 _VALID_GRANULARITIES = ("per_tensor", "per_row", "per_head")
@@ -46,6 +47,7 @@ def sc_matmul(
     rng_levels: Optional[int] = None,
     config: Optional[dict] = None,
     halve_bipolar_stoc_len: bool = False,
+    smooth_scales: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Stochastic-computing matmul ``a @ b.T``.
 
@@ -93,6 +95,14 @@ def sc_matmul(
             ``2 ** (sc_prec - 1)`` (≈2× fewer cycles, same magnitude grid).
             Has no effect when ``mode == "unipolar"``. Default ``False``
             preserves legacy behavior.
+        smooth_scales: optional ``(D,)`` SmoothQuant per-channel scaling
+            vector. When provided, the matmul is rewritten as
+            ``(a / s) @ (b * s).T`` — mathematically equivalent, but
+            migrates per-channel activation outliers into the weight so
+            both operands are easier to quantize. Build ``s`` once from
+            calibration statistics via
+            :func:`scmp_kernels.quant.compute_smooth_scales`. ``None``
+            (default) leaves behavior unchanged.
 
     Returns:
         Output tensor. 2D inputs → ``(N, M)`` float32. 3D inputs → ``(BH, N, M)``
@@ -124,6 +134,14 @@ def sc_matmul(
             stoc_len = halved
         if rng_levels is None:
             rng_levels = halved
+
+    # ---- SmoothQuant pre-transform ------------------------------------------
+    # Migrate per-channel activation outliers into the weight via a
+    # mathematically equivalent diagonal rescaling along D. The downstream
+    # int-quant kernels are unchanged — they just see better-conditioned
+    # operands.
+    if smooth_scales is not None:
+        a, b = apply_smoothing(a, b, smooth_scales)
 
     # ---- chunk_d compatibility gate -----------------------------------------
     # Currently chunk_d is only implemented in the per-row + bipolar MLP

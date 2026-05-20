@@ -27,6 +27,12 @@ from .grouped import (
     _grouped_asymmetric_quant,
     _grouped_symmetric_quant_batched,
 )
+from .smoothquant import (
+    accumulate_act_scales,
+    compute_smooth_scales,
+    apply_smoothing,
+    apply_smoothing_offline,
+)
 
 __all__ = [
     "fused_quant_kernel",
@@ -38,4 +44,8 @@ __all__ = [
     "_grouped_symmetric_quant",
     "_grouped_asymmetric_quant",
     "_grouped_symmetric_quant_batched",
+    "accumulate_act_scales",
+    "compute_smooth_scales",
+    "apply_smoothing",
+    "apply_smoothing_offline",
 ]
