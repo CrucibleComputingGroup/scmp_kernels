@@ -59,7 +59,7 @@ sc_matmul(a, b,
     group_b: int = 1,                        # row-group size on operand b
     rng_levels: int | None = None,           # mixed-precision stream lengths
     config: dict | None = None,              # Sobol/Owen config; auto-built if None
-    halve_bipolar_stoc_len: bool = False,    # bipolar: run at stoc_len/2
+    halve_bipolar_stoc_len: bool = False,    # bipolar: if stoc_len/rng_levels are None, default to 2 ** (sc_prec - 1)
     smooth_scales: torch.Tensor | None = None,  # SmoothQuant per-channel scales
 ) -> torch.Tensor
 ```
