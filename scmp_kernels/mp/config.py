@@ -91,6 +91,29 @@ def _parse_bucket_key(bucket_key: str) -> tuple[str, int, int]:
         ) from exc
 
 
+def _parse_protected_channel_key(key: str) -> tuple[str, int, Optional[int]]:
+    """Parse protected-channel keys like 'q_proj:b12' or 'up_proj:b3:u7'."""
+    try:
+        parts = key.split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError
+        operator, b_part = parts[0], parts[1]
+        if not b_part.startswith("b"):
+            raise ValueError
+        unit = None
+        if len(parts) == 3:
+            u_part = parts[2]
+            if not u_part.startswith("u"):
+                raise ValueError
+            unit = int(u_part[1:])
+        return operator, int(b_part[1:]), unit
+    except Exception as exc:  # pragma: no cover - defensive parsing
+        raise ValueError(
+            f"Invalid protected-channel key '{key}'. "
+            "Expected '<operator>:b<int>' or '<operator>:b<int>:u<int>'."
+        ) from exc
+
+
 def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
     """Extract a threshold list of length n_levels-1 from a table payload."""
     raw_thresholds = payload.get("thresholds") if isinstance(payload, dict) else payload
@@ -228,6 +251,8 @@ class AdaptiveMPConfig:
     layer_buckets: int = 1
     operator_default_thresholds: dict[str, list[float]] = field(default_factory=dict)
     bucket_thresholds: dict[tuple[str, int, int], list[float]] = field(default_factory=dict)
+    protected_channel_stoc_len: Optional[int] = None
+    protected_channel_indices: dict[tuple[str, int, Optional[int]], list[int]] = field(default_factory=dict)
     # When set, bypass the linear-threshold classifier and use these fractions
     # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
     # Length must match stoc_len_levels; sums to 1.
@@ -269,6 +294,8 @@ class AdaptiveMPConfig:
         self.layer_buckets = int(payload.get("layer_buckets", 1))
         self.operator_default_thresholds = {}
         self.bucket_thresholds = {}
+        self.protected_channel_stoc_len = None
+        self.protected_channel_indices = {}
 
         for operator, operator_payload in payload.get("operator_defaults", {}).items():
             self.operator_default_thresholds[operator] = _extract_thresholds(
@@ -284,6 +311,15 @@ class AdaptiveMPConfig:
                 len(self.stoc_len_levels),
                 bucket_key,
             )
+
+        protected = payload.get("protected_channels") or {}
+        indices = protected.get("indices") or {}
+        if indices:
+            self.protected_channel_stoc_len = int(protected.get("stoc_len", 128))
+            for key, vals in indices.items():
+                self.protected_channel_indices[_parse_protected_channel_key(key)] = [
+                    int(v) for v in vals
+                ]
 
     def get_thresholds(
         self,
@@ -303,6 +339,21 @@ class AdaptiveMPConfig:
         if operator and operator in self.operator_default_thresholds:
             return self.operator_default_thresholds[operator]
         return None
+
+    def get_protected_channels(
+        self,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        unit_idx: Optional[int] = None,
+    ) -> Optional[list[int]]:
+        """Return protected input-channel indices for one linear module."""
+        if not operator or block_idx is None:
+            return None
+        key = (operator, int(block_idx), unit_idx)
+        vals = self.protected_channel_indices.get(key)
+        if vals is not None:
+            return vals
+        return self.protected_channel_indices.get((operator, int(block_idx), None))
 
 
 def adaptive_classify_rows(
