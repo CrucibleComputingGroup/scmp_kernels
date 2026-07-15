@@ -139,6 +139,35 @@ def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
     return thresholds
 
 
+_ROW_METRIC_EPS = 1e-12
+# Candidate per-row dispatch metrics (act_global_v2 ρ-selection). All are O(D)
+# reductions over the last dim — same runtime cost class as the original amax.
+ROW_METRIC_NAMES = ("amax", "l2", "crest")
+
+
+def compute_row_metric(x: torch.Tensor, name: str) -> torch.Tensor:
+    """Per-row dispatch metric over the LAST dim of ``x``.
+
+    ``amax``  = ‖row‖_inf (the original metric),
+    ``l2``    = ‖row‖_2,
+    ``crest`` = ‖row‖_inf / ‖row‖_2 (scale-free peakedness).
+
+    The caller multiplies by the calibrated sign (−1 inverts the ranking; the
+    min–max normalization inside ``adaptive_classify_rows`` maps sign-flipped
+    values to exactly ``1 − normalized(raw)``, matching the calibration-side
+    transform in calibrate_mp_thresholds.py).
+    """
+    if name == "amax":
+        return x.abs().amax(dim=-1)
+    if name == "l2":
+        return x.float().norm(dim=-1)
+    if name == "crest":
+        xf = x.float()
+        return xf.abs().amax(dim=-1) / (xf.norm(dim=-1) + _ROW_METRIC_EPS)
+    raise ValueError(f"unknown dispatch metric '{name}' "
+                     f"(expected one of {ROW_METRIC_NAMES})")
+
+
 def _classify_rows_by_thresholds(
     metric_norm: torch.Tensor,
     stoc_len_levels: list[int],
@@ -253,6 +282,10 @@ class AdaptiveMPConfig:
     bucket_thresholds: dict[tuple[str, int, int], list[float]] = field(default_factory=dict)
     protected_channel_stoc_len: Optional[int] = None
     protected_channel_indices: dict[tuple[str, int, Optional[int]], list[int]] = field(default_factory=dict)
+    # act_global_v2 ρ-selected dispatch metric: operator -> (name, sign).
+    # Absent operator => ("amax", +1.0), byte-identical to the original
+    # dispatch. Populated from the table's "dispatch_metrics" payload.
+    dispatch_metrics: dict[str, tuple[str, float]] = field(default_factory=dict)
     # When set, bypass the linear-threshold classifier and use these fractions
     # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
     # Length must match stoc_len_levels; sums to 1.
@@ -321,6 +354,15 @@ class AdaptiveMPConfig:
                     int(v) for v in vals
                 ]
 
+        self.dispatch_metrics = {}
+        for op, spec in (payload.get("dispatch_metrics") or {}).items():
+            name = str(spec.get("metric", "amax"))
+            if name not in ROW_METRIC_NAMES:
+                raise ValueError(
+                    f"Adaptive MP table dispatch_metrics[{op}] names unknown "
+                    f"metric '{name}' (expected one of {ROW_METRIC_NAMES}).")
+            self.dispatch_metrics[op] = (name, float(spec.get("sign", 1.0)))
+
     def get_thresholds(
         self,
         timestep: int,
@@ -339,6 +381,15 @@ class AdaptiveMPConfig:
         if operator and operator in self.operator_default_thresholds:
             return self.operator_default_thresholds[operator]
         return None
+
+    def get_dispatch_metric(self, operator: Optional[str]) -> tuple[str, float]:
+        """(metric_name, sign) for one operator's per-row dispatch.
+
+        Default ("amax", +1.0) — the original dispatch — for operators the
+        table did not switch (or when the table predates dispatch_metrics)."""
+        if operator and self.dispatch_metrics:
+            return self.dispatch_metrics.get(operator, ("amax", 1.0))
+        return ("amax", 1.0)
 
     def get_protected_channels(
         self,
