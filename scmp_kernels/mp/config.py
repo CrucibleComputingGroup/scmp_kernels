@@ -91,6 +91,29 @@ def _parse_bucket_key(bucket_key: str) -> tuple[str, int, int]:
         ) from exc
 
 
+def _parse_protected_channel_key(key: str) -> tuple[str, int, Optional[int]]:
+    """Parse protected-channel keys like 'q_proj:b12' or 'up_proj:b3:u7'."""
+    try:
+        parts = key.split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError
+        operator, b_part = parts[0], parts[1]
+        if not b_part.startswith("b"):
+            raise ValueError
+        unit = None
+        if len(parts) == 3:
+            u_part = parts[2]
+            if not u_part.startswith("u"):
+                raise ValueError
+            unit = int(u_part[1:])
+        return operator, int(b_part[1:]), unit
+    except Exception as exc:  # pragma: no cover - defensive parsing
+        raise ValueError(
+            f"Invalid protected-channel key '{key}'. "
+            "Expected '<operator>:b<int>' or '<operator>:b<int>:u<int>'."
+        ) from exc
+
+
 def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
     """Extract a threshold list of length n_levels-1 from a table payload."""
     raw_thresholds = payload.get("thresholds") if isinstance(payload, dict) else payload
@@ -114,6 +137,35 @@ def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
                 f"got {thresholds}."
             )
     return thresholds
+
+
+_ROW_METRIC_EPS = 1e-12
+# Candidate per-row dispatch metrics (act_global_v2 ρ-selection). All are O(D)
+# reductions over the last dim — same runtime cost class as the original amax.
+ROW_METRIC_NAMES = ("amax", "l2", "crest")
+
+
+def compute_row_metric(x: torch.Tensor, name: str) -> torch.Tensor:
+    """Per-row dispatch metric over the LAST dim of ``x``.
+
+    ``amax``  = ‖row‖_inf (the original metric),
+    ``l2``    = ‖row‖_2,
+    ``crest`` = ‖row‖_inf / ‖row‖_2 (scale-free peakedness).
+
+    The caller multiplies by the calibrated sign (−1 inverts the ranking; the
+    min–max normalization inside ``adaptive_classify_rows`` maps sign-flipped
+    values to exactly ``1 − normalized(raw)``, matching the calibration-side
+    transform in calibrate_mp_thresholds.py).
+    """
+    if name == "amax":
+        return x.abs().amax(dim=-1)
+    if name == "l2":
+        return x.float().norm(dim=-1)
+    if name == "crest":
+        xf = x.float()
+        return xf.abs().amax(dim=-1) / (xf.norm(dim=-1) + _ROW_METRIC_EPS)
+    raise ValueError(f"unknown dispatch metric '{name}' "
+                     f"(expected one of {ROW_METRIC_NAMES})")
 
 
 def _classify_rows_by_thresholds(
@@ -228,6 +280,12 @@ class AdaptiveMPConfig:
     layer_buckets: int = 1
     operator_default_thresholds: dict[str, list[float]] = field(default_factory=dict)
     bucket_thresholds: dict[tuple[str, int, int], list[float]] = field(default_factory=dict)
+    protected_channel_stoc_len: Optional[int] = None
+    protected_channel_indices: dict[tuple[str, int, Optional[int]], list[int]] = field(default_factory=dict)
+    # act_global_v2 ρ-selected dispatch metric: operator -> (name, sign).
+    # Absent operator => ("amax", +1.0), byte-identical to the original
+    # dispatch. Populated from the table's "dispatch_metrics" payload.
+    dispatch_metrics: dict[str, tuple[str, float]] = field(default_factory=dict)
     # When set, bypass the linear-threshold classifier and use these fractions
     # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
     # Length must match stoc_len_levels; sums to 1.
@@ -269,6 +327,8 @@ class AdaptiveMPConfig:
         self.layer_buckets = int(payload.get("layer_buckets", 1))
         self.operator_default_thresholds = {}
         self.bucket_thresholds = {}
+        self.protected_channel_stoc_len = None
+        self.protected_channel_indices = {}
 
         for operator, operator_payload in payload.get("operator_defaults", {}).items():
             self.operator_default_thresholds[operator] = _extract_thresholds(
@@ -284,6 +344,24 @@ class AdaptiveMPConfig:
                 len(self.stoc_len_levels),
                 bucket_key,
             )
+
+        protected = payload.get("protected_channels") or {}
+        indices = protected.get("indices") or {}
+        if indices:
+            self.protected_channel_stoc_len = int(protected.get("stoc_len", 128))
+            for key, vals in indices.items():
+                self.protected_channel_indices[_parse_protected_channel_key(key)] = [
+                    int(v) for v in vals
+                ]
+
+        self.dispatch_metrics = {}
+        for op, spec in (payload.get("dispatch_metrics") or {}).items():
+            name = str(spec.get("metric", "amax"))
+            if name not in ROW_METRIC_NAMES:
+                raise ValueError(
+                    f"Adaptive MP table dispatch_metrics[{op}] names unknown "
+                    f"metric '{name}' (expected one of {ROW_METRIC_NAMES}).")
+            self.dispatch_metrics[op] = (name, float(spec.get("sign", 1.0)))
 
     def get_thresholds(
         self,
@@ -303,6 +381,30 @@ class AdaptiveMPConfig:
         if operator and operator in self.operator_default_thresholds:
             return self.operator_default_thresholds[operator]
         return None
+
+    def get_dispatch_metric(self, operator: Optional[str]) -> tuple[str, float]:
+        """(metric_name, sign) for one operator's per-row dispatch.
+
+        Default ("amax", +1.0) — the original dispatch — for operators the
+        table did not switch (or when the table predates dispatch_metrics)."""
+        if operator and self.dispatch_metrics:
+            return self.dispatch_metrics.get(operator, ("amax", 1.0))
+        return ("amax", 1.0)
+
+    def get_protected_channels(
+        self,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        unit_idx: Optional[int] = None,
+    ) -> Optional[list[int]]:
+        """Return protected input-channel indices for one linear module."""
+        if not operator or block_idx is None:
+            return None
+        key = (operator, int(block_idx), unit_idx)
+        vals = self.protected_channel_indices.get(key)
+        if vals is not None:
+            return vals
+        return self.protected_channel_indices.get((operator, int(block_idx), None))
 
 
 def adaptive_classify_rows(
