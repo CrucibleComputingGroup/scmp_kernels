@@ -92,6 +92,7 @@ def clear_rng_cache():
     _rng_seq_cache.clear()
     _enable_table_cache.clear()
     _k_table_cache.clear()
+    _cum_indicator_cache.clear()
 
 
 
@@ -600,6 +601,18 @@ from collections import OrderedDict as _OrderedDict
 _ENABLE_TABLE_CACHE_MAX = int(os.environ.get("SC_ENABLE_TABLE_CACHE_MAX", "32"))
 _enable_table_cache: "_OrderedDict[str, tuple[torch.Tensor, torch.Tensor]]" = _OrderedDict()
 _k_table_cache: "_OrderedDict[str, torch.Tensor]" = _OrderedDict()
+# Chunked-MLP cum_indicator, same key discipline as _enable_table_cache.
+_cum_indicator_cache: "_OrderedDict[str, torch.Tensor]" = _OrderedDict()
+
+
+def _cum_cache_enabled() -> bool:
+    """SC_CUM_INDICATOR_CACHE=0 restores the per-call rebuild.
+
+    Exists so the bit-identity control run can be produced from the SAME
+    binary: the cache must not change a single output bit, only how often the
+    table is built.
+    """
+    return os.environ.get("SC_CUM_INDICATOR_CACHE", "1") != "0"
 
 
 def _lru_get(cache, key):
@@ -860,6 +873,39 @@ def _get_cached_enable_tables(
     return _lru_put(_enable_table_cache, key, build_enable_tables(
         rng_a, rng_b, sc_prec, stoc_len, rng_levels=grid_levels
     ))
+
+
+def _get_cached_cum_indicator(
+    key: str,
+    rng_b: torch.Tensor,
+    chunk_d: int,
+    stoc_len: int,
+    V: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Cache the chunked-MLP cum_indicator across calls.
+
+    The table is a pure function of (rng_b, chunk_d, stoc_len, V) and rng_b is
+    itself served from _get_cached_sequences, so every SCLinear in the model
+    that shares (config, sc_prec, stoc_len, rng_levels) builds a byte-identical
+    table.  The non-chunked (attention) path has cached this since day one via
+    _get_cached_enable_tables; the chunked MLP path rebuilt it on EVERY call --
+    measured at 37,621 rebuilds per 2048-token window on Qwen3-30B-A3B (128
+    experts x 3 projections x 48 layers) and 983 on the 14B dense model, each
+    one a 4.3 MB int16 allocation plus a Triton launch.
+
+    Returned tensors are READ-ONLY by contract: the matmul kernels only load
+    from cum_indicator, and nothing writes to it after build_cum_indicator_kernel.
+    """
+    cached = _lru_get(_cum_indicator_cache, key)
+    if cached is not None:
+        return cached
+    cum_indicator = torch.zeros(
+        chunk_d, stoc_len + 1, V, dtype=torch.int16, device=device)
+    build_cum_indicator_kernel[(chunk_d,)](
+        rng_b, cum_indicator, chunk_d, stoc_len, V,
+    )
+    return _lru_put(_cum_indicator_cache, key, cum_indicator)
 
 
 def _get_cached_k_table(
@@ -1361,6 +1407,7 @@ def _sc_matmul_bipolar_mlp_chunked(
     a, b, sc_prec, k_table, rng_b, chunk_d,
     stoc_len=None,
     rng_levels: Optional[int] = None,
+    cum_cache_key: Optional[str] = None,
 ):
     """
     Bipolar SC matmul for MLP with internal chunk_d loop.
@@ -1387,12 +1434,20 @@ def _sc_matmul_bipolar_mlp_chunked(
     device = a.device
     output = torch.zeros(N, M, dtype=torch.float32, device=device)
 
-    # Build cum_indicator ONCE — all chunks share the same RNG sequences
-    cum_indicator = torch.zeros(chunk_d, stoc_len + 1, V, dtype=torch.int16, device=device)
-    build_cum_indicator_kernel[(chunk_d,)](
-        rng_b, cum_indicator,
-        chunk_d, stoc_len, V,
-    )
+    # Build cum_indicator ONCE — all chunks share the same RNG sequences.
+    # With a cache key, reuse it across CALLS too (see
+    # _get_cached_cum_indicator); without one, keep the per-call build so any
+    # future caller is bit-identical to the old behaviour by default.
+    if cum_cache_key is not None and _cum_cache_enabled():
+        cum_indicator = _get_cached_cum_indicator(
+            cum_cache_key, rng_b, chunk_d, stoc_len, V, device)
+    else:
+        cum_indicator = torch.zeros(
+            chunk_d, stoc_len + 1, V, dtype=torch.int16, device=device)
+        build_cum_indicator_kernel[(chunk_d,)](
+            rng_b, cum_indicator,
+            chunk_d, stoc_len, V,
+        )
 
     # Tiled matmul params — adaptive tile size for small N/M
     if N <= 64 or M <= 64:
@@ -1599,6 +1654,9 @@ def _sc_matmul_per_row_mlp(
         result = _sc_matmul_bipolar_mlp_chunked(
             a, b, sc_prec, k_table, rng_b, chunk_d,
             stoc_len=stoc_len, rng_levels=grid_levels,
+            cum_cache_key=(
+                _enable_table_cache_key(config, sc_prec, a.device)
+                + f"|cum|cd={chunk_d}|sl={stoc_len}|rng={grid_levels}"),
         )
 
         if device.type != 'cuda':
