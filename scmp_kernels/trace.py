@@ -54,10 +54,20 @@ Coverage and known semantics
 * Uniform (non-MP) attention runs record one 3D call with
   ``batch = B*H`` and ``unit = null``; MP attention runs record per-head
   2D calls (``unit`` = head index). Consumers must accept both flavors.
-* ``d_in``/``d_out`` are *representative* (first call of the group): for
-  autoregressive decode, attention's KV length grows per step, in which
-  case the group is flagged ``dims_vary`` (``macs``/``rows``/``row_cycles``
-  stay exact — they accumulate true per-call values).
+* ``d_in``/``d_out`` are part of the summary key, so
+  ``rows * d_in * d_out == macs`` holds for every group with
+  ``dims_vary: false``. The exception is bounded memory: at most
+  ``_MAX_SHAPES`` (env ``SC_MP_TRACE_MAX_SHAPES``, default 32) distinct
+  shapes per base key get their own group, because autoregressive decode
+  grows attention's KV length every step and would otherwise mint one
+  group per step. Shapes past the cap fold into one catch-all group with
+  *representative* dims and ``dims_vary: true``; there and only there,
+  ``rows * d_in * d_out != macs``. ``macs``/``rows``/``row_cycles`` are
+  always exact — they accumulate true per-call values.
+  Traces written before 2026-07-29 keyed without dims and can collapse
+  two static shapes (e.g. an operator's protected-channel slice sharing a
+  ``stoc_len`` with its main slice) into a fictitious shape; see
+  ``hpca_results/llm/ppl/mp_best/repair_traces.py`` for the offline fix.
 
 Output schemas
 --------------
@@ -108,10 +118,24 @@ _LOCK = threading.Lock()
 _TLS = threading.local()                   # per-thread (op, block, unit)
 # summary accumulator:
 #   key -> [calls, rows, macs, row_cycles, d_in, d_out, dims_vary]
+# where key = (block, op, unit, stoc_len, sc_prec, halve, mode, granularity,
+#              rng_levels, chunk_d, smoothed, d_in, d_out)
 _SUMMARY: dict = {}
+# base key (the above minus d_in/d_out) -> set of shapes that own a group.
+# Bounds the group count when dims genuinely vary per call (KV growth).
+_SHAPES: dict = {}
 _TRACE: list = []
 _SPILL = 100_000                           # trace-mode records per disk spill
 _FH = None                                 # open spill file handle (trace mode)
+
+# Distinct (d_in, d_out) per base key that get their own exact group before
+# the rest fold into a dims_vary catch-all. Static-shape operators use 1-2.
+try:
+    _MAX_SHAPES = int(os.environ.get("SC_MP_TRACE_MAX_SHAPES", "32"))
+except ValueError:
+    _MAX_SHAPES = 32
+if _MAX_SHAPES < 1:
+    _MAX_SHAPES = 1
 
 
 def is_enabled() -> bool:
@@ -146,6 +170,7 @@ def reset() -> None:
     global _SEQ, _FH
     with _LOCK:
         _SUMMARY.clear()
+        _SHAPES.clear()
         _TRACE.clear()
         _SEQ = 0
         if _FH is not None:
@@ -215,16 +240,32 @@ def record_matmul(*, rows: int, d_in: int, d_out: int, batch: int,
                     _FH.write(json.dumps(rec) + "\n")
                 _TRACE.clear()
         else:
-            # d_in/d_out stay OUT of the key: attention dims vary per decode
-            # step (KV growth), which would mint one group per step. They are
-            # kept as representative payload + a dims_vary flag instead;
-            # macs/rows/row_cycles accumulate exact per-call values.
-            key = (block, op, unit, stoc_len, sc_prec, halve, mode,
-                   granularity, rng_levels, chunk_d, smoothed)
+            # d_in/d_out ARE part of the key, so rows*d_in*d_out == macs holds
+            # per group and consumers get real shapes. The reason they were
+            # once excluded is bounded memory: attention's KV length grows per
+            # decode step, which would mint one group per step. That is handled
+            # by a per-base-key shape cap instead — the first _MAX_SHAPES
+            # distinct (d_in, d_out) get exact groups, anything beyond folds
+            # into one catch-all group carrying representative dims and
+            # dims_vary=True. Static-shape operators (linears, and the
+            # protected-channel slice that shares their stoc_len) never reach
+            # the cap, so they no longer collapse into a fictitious shape.
+            base = (block, op, unit, stoc_len, sc_prec, halve, mode,
+                    granularity, rng_levels, chunk_d, smoothed)
+            shapes = _SHAPES.get(base)
+            if shapes is None:
+                shapes = _SHAPES[base] = set()
+            if (d_in, d_out) in shapes:
+                key = base + (d_in, d_out)
+            elif len(shapes) < _MAX_SHAPES:
+                shapes.add((d_in, d_out))
+                key = base + (d_in, d_out)
+            else:
+                key = base + (None, None)      # over cap: dims genuinely vary
             acc = _SUMMARY.get(key)
             if acc is None:
                 _SUMMARY[key] = [1, rows_total, macs, row_cycles,
-                                 d_in, d_out, False]
+                                 d_in, d_out, key[-1] is None]
             else:
                 acc[0] += 1
                 acc[1] += rows_total
@@ -307,8 +348,9 @@ def flush(path: Optional[str] = None, header_extra: Optional[dict] = None,
             else:
                 groups = []
                 for (block, op, unit, sl, prec, halve, mode, gran, rngl,
-                     ckd, smoothed), (calls, rows, macs, cyc, d_in, d_out,
-                                      vary) in sorted(
+                     ckd, smoothed, _kd_in, _kd_out), (
+                        calls, rows, macs, cyc, d_in, d_out,
+                        vary) in sorted(
                         _SUMMARY.items(),
                         key=lambda kv: (kv[0][0] if kv[0][0] is not None
                                         else -1, str(kv[0][1]),
@@ -329,6 +371,7 @@ def flush(path: Optional[str] = None, header_extra: Optional[dict] = None,
                               indent=1)
         if reset_after:
             _SUMMARY.clear()
+            _SHAPES.clear()
             _TRACE.clear()
             _SEQ = 0
         return out
