@@ -229,5 +229,123 @@ class ClassifyLevelValuesTest(unittest.TestCase):
                          GLOBAL)
 
 
+class EscapeGateUsesTheBucketLadderTest(unittest.TestCase):
+    """The escape gate must rebuild against the ladder classification USED.
+
+    Third instance of the same family as ClassifyLevelValuesTest above.
+    ``_apply_escape_gate`` re-keys ``level_row_indices`` by stoc_len VALUE for
+    every rung, so reading the GLOBAL ladder there while
+    ``adaptive_classify_rows`` classified against the per-bucket ladder makes
+    every row run at the global rung value for its index -- the bucket ladder is
+    discarded outright. It is invisible downstream: SCLinear just iterates
+    whatever keys it is handed (sc_common.py:581) and the MP tracker prices the
+    assignment rather than measuring it, so realized_flop_avg_sl still lands in
+    band and the cell looks valid.
+
+    Dormant in every shipped config -- all 8 deployed t32/t48 cells run
+    escape_gate_k=2.0 with ZERO per-bucket ladders -- so the fix is a no-op on
+    them (pinned by NoBucketLadderIsUnaffected below) and fires only for
+    per-band/per-group work.
+    """
+
+    ESC = 128          # not a rung of GLOBAL, ATTN or MLP -> gets its own index
+
+    def _cfg(self, grouped, k=2.0):
+        # _bucket sets metric_mean=0.5, metric_std=0.1 -> t_esc = 0.5 + k*0.1
+        buckets = {}
+        for i in range(4):
+            buckets[f"down_proj:t0:l{i}"] = _bucket(
+                [0.7, 0.5, 0.3], MLP if grouped else None)
+            buckets[f"qk:t0:l{i}"] = _bucket(
+                [0.7, 0.5, 0.3], ATTN if grouped else None)
+        return AdaptiveMPConfig(
+            stoc_len_levels=list(GLOBAL),
+            threshold_table_path=_write({"buckets": buckets}),
+            timestep_buckets=1,
+            layer_buckets=4,
+            escape_gate_k=k,
+            escape_stoc_len=self.ESC,
+        )
+
+    def _classify(self, cfg, op):
+        # linspace spans [0,1] so metric_norm == metric; t_esc = 0.7 fires.
+        return adaptive_classify_rows(
+            torch.linspace(0.0, 1.0, 64), cfg, operator=op,
+            block_idx=0, total_blocks=4)
+
+    def test_escaped_assignment_is_keyed_by_the_bucket_ladder(self):
+        cfg = self._cfg(grouped=True)
+        got = self._classify(cfg, "down_proj")
+        self.assertEqual(sorted(got.level_row_indices),
+                         sorted(MLP + [self.ESC]),
+                         "gate re-keyed the assignment against the wrong "
+                         "ladder; rows would run at global rung values")
+        # and the other bucket keeps ITS ladder, not down_proj's and not global
+        self.assertEqual(sorted(self._classify(cfg, "qk").level_row_indices),
+                         sorted(ATTN + [self.ESC]))
+
+    def test_no_global_rung_value_leaks_in(self):
+        # the pre-fix failure mode, stated positively: GLOBAL-only values
+        # (96, 64) must not appear for a bucket whose ladder is MLP
+        keys = set(self._classify(self._cfg(grouped=True),
+                                  "down_proj").level_row_indices)
+        self.assertFalse(keys & (set(GLOBAL) - set(MLP)),
+                         f"global rung values leaked into the assignment: "
+                         f"{sorted(keys)}")
+
+    def test_every_row_still_assigned_exactly_once(self):
+        got = self._classify(self._cfg(grouped=True), "down_proj")
+        total = sum(v.numel() for v in got.level_row_indices.values())
+        self.assertEqual(total, 64)
+        # escaped rows are exactly those strictly above t_esc = 0.7
+        metric = torch.linspace(0.0, 1.0, 64)
+        expected = torch.where(metric > 0.7)[0]
+        self.assertTrue(
+            torch.equal(got.level_row_indices[self.ESC].sort().values,
+                        expected))
+
+    def test_gate_that_cannot_fire_leaves_the_bucket_ladder_alone(self):
+        # k=6 -> t_esc = 1.1 >= 1.0, early return before any rebuild
+        got = self._classify(self._cfg(grouped=True, k=6.0), "down_proj")
+        self.assertEqual(sorted(got.level_row_indices), sorted(MLP))
+
+
+class NoBucketLadderIsUnaffectedTest(unittest.TestCase):
+    """Regression guard: the deployed shape (gate on, no per-bucket ladder).
+
+    All 8 deployed t32/t48 cells are exactly this. The gate fix must not move
+    them at all, so their archived PPLs stay reproducible.
+    """
+
+    ESC = 128
+
+    def _cfg(self):
+        buckets = {f"down_proj:t0:l{i}": _bucket([0.7, 0.5, 0.3])
+                   for i in range(4)}
+        return AdaptiveMPConfig(
+            stoc_len_levels=list(GLOBAL),
+            threshold_table_path=_write({"buckets": buckets}),
+            timestep_buckets=1,
+            layer_buckets=4,
+            escape_gate_k=2.0,
+            escape_stoc_len=self.ESC,
+        )
+
+    def test_keys_are_the_global_ladder_plus_escape(self):
+        cfg = self._cfg()
+        got = adaptive_classify_rows(
+            torch.linspace(0.0, 1.0, 64), cfg, operator="down_proj",
+            block_idx=0, total_blocks=4)
+        self.assertEqual(sorted(got.level_row_indices),
+                         sorted(GLOBAL + [self.ESC]))
+
+    def test_get_levels_still_returns_the_global_list_itself(self):
+        # identity, not equality -- what the fix reads must BE the global list
+        cfg = self._cfg()
+        self.assertIs(
+            cfg.get_levels(operator="down_proj", block_idx=0, total_blocks=4),
+            cfg.stoc_len_levels)
+
+
 if __name__ == "__main__":
     unittest.main()
