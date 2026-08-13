@@ -28,6 +28,7 @@ from .kernels import (
     _sc_matmul_per_head_bipolar,
 )
 from ..quant.smoothquant import apply_smoothing
+from .. import trace as _trace
 
 
 _VALID_GRANULARITIES = ("per_tensor", "per_row", "per_head")
@@ -219,6 +220,27 @@ def _sc_matmul_impl(
             raise ValueError(
                 f"sc_matmul: granularity='per_head' currently only supports "
                 f"mode='bipolar', got '{mode}'.")
+
+    # Host-side shape metadata only: no tensor reads and no device sync. This
+    # is intentionally after validation and cycle halving so rejected calls
+    # are absent and the trace reports the effective precision.
+    if _trace._ENABLED:
+        if a.dim() == 3:
+            batch, rows, d_in = a.shape
+        else:
+            rows, d_in = a.shape
+            batch = 1
+        _trace.record_matmul(
+            rows=int(rows), d_in=int(d_in), d_out=int(b.shape[-2]),
+            batch=int(batch),
+            stoc_len=int(stoc_len) if stoc_len is not None else 2 ** sc_prec,
+            sc_prec=sc_prec, mode=mode, granularity=granularity,
+            halve=bool(halve_bipolar_stoc_len and mode == "bipolar"),
+            rng_levels=(int(rng_levels) if rng_levels is not None
+                        else 2 ** sc_prec),
+            chunk_d=chunk_d,
+            smoothed=smooth_scales is not None,
+        )
 
     # ---- dispatch ------------------------------------------------------------
     if granularity == "per_tensor":

@@ -91,6 +91,36 @@ def _parse_bucket_key(bucket_key: str) -> tuple[str, int, int]:
         ) from exc
 
 
+def _extract_group_levels(payload, source: str) -> Optional[list[int]]:
+    """Extract an optional per-bucket ladder.
+
+    A CNN table may give different operator/depth buckets different rung
+    values while retaining the calibrated thresholds for each bucket.  The
+    levels must be strictly descending because ``RowAssignment`` keys its
+    subsets by the stoc_len value; duplicate levels would silently merge.
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("stoc_len_levels")
+    if raw is None:
+        return None
+    levels = [int(value) for value in raw]
+    if len(levels) < 2:
+        raise ValueError(
+            f"Per-group stoc_len_levels for {source} must have >= 2 rungs, "
+            f"got {levels}.")
+    if any(levels[index] >= levels[index - 1]
+           for index in range(1, len(levels))):
+        raise ValueError(
+            f"Per-group stoc_len_levels for {source} must be strictly "
+            f"descending, got {levels}.")
+    if levels[-1] < 0:
+        raise ValueError(
+            f"Per-group stoc_len_levels for {source} has a negative rung: "
+            f"{levels}.")
+    return levels
+
+
 def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
     """Extract a threshold list of length n_levels-1 from a table payload."""
     raw_thresholds = payload.get("thresholds") if isinstance(payload, dict) else payload
@@ -114,6 +144,25 @@ def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
                 f"got {thresholds}."
             )
     return thresholds
+
+
+_ROW_METRIC_EPS = 1e-12
+# Candidate per-row dispatch metrics. All are O(D) reductions over the last
+# dimension, matching the runtime cost class of the original abs-max metric.
+ROW_METRIC_NAMES = ("amax", "l2", "crest")
+
+
+def compute_row_metric(x: torch.Tensor, name: str) -> torch.Tensor:
+    """Compute one dispatch metric per row over the last dimension."""
+    if name == "amax":
+        return x.abs().amax(dim=-1)
+    if name == "l2":
+        return x.float().norm(dim=-1)
+    if name == "crest":
+        xf = x.float()
+        return xf.abs().amax(dim=-1) / (xf.norm(dim=-1) + _ROW_METRIC_EPS)
+    raise ValueError(
+        f"unknown dispatch metric {name!r} (expected one of {ROW_METRIC_NAMES})")
 
 
 def _classify_rows_by_thresholds(
@@ -228,6 +277,12 @@ class AdaptiveMPConfig:
     layer_buckets: int = 1
     operator_default_thresholds: dict[str, list[float]] = field(default_factory=dict)
     bucket_thresholds: dict[tuple[str, int, int], list[float]] = field(default_factory=dict)
+    # Optional bucket-specific ladders. Empty dictionaries preserve the
+    # historical single global ladder exactly.
+    bucket_stoc_len_levels: dict[tuple[str, int, int], list[int]] = field(
+        default_factory=dict)
+    operator_default_stoc_len_levels: dict[str, list[int]] = field(
+        default_factory=dict)
     # When set, bypass the linear-threshold classifier and use these fractions
     # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
     # Length must match stoc_len_levels; sums to 1.
@@ -239,6 +294,18 @@ class AdaptiveMPConfig:
     # channels (see scmp_llm model/sc_common.py SCLinear MP path).
     protected_channels: dict = field(default_factory=dict)
     protected_channel_stoc_len: Optional[int] = None
+    # Per-operator metric selected during calibration. A negative sign inverts
+    # the ranking after min-max normalization. Missing entries retain amax.
+    dispatch_metrics: dict[str, tuple[str, float]] = field(default_factory=dict)
+    # Additive outlier escape.  The threshold for a bucket is computed from
+    # its calibration-time normalized signed metric statistics:
+    # metric_mean + escape_gate_k * metric_std.
+    escape_gate_k: Optional[float] = None
+    escape_stoc_len: int = 128
+    bucket_escape_thresholds: dict[tuple[str, int, int], float] = field(
+        default_factory=dict)
+    operator_default_escape_thresholds: dict[str, float] = field(
+        default_factory=dict)
 
     def __post_init__(self):
         assert len(self.stoc_len_levels) >= 2, (
@@ -249,6 +316,16 @@ class AdaptiveMPConfig:
                 f"got {self.stoc_len_levels}")
         if not self.enable_pruning and 0 in self.stoc_len_levels:
             self.stoc_len_levels = [s for s in self.stoc_len_levels if s > 0]
+        if self.escape_gate_k is not None:
+            self.escape_gate_k = float(self.escape_gate_k)
+            self.escape_stoc_len = int(self.escape_stoc_len)
+            if self.escape_stoc_len <= 0:
+                raise ValueError(
+                    "escape_stoc_len must be a positive cycle count, "
+                    f"got {self.escape_stoc_len}")
+            if not self.threshold_table_path:
+                raise ValueError(
+                    "escape_gate_k requires a calibrated threshold table")
         if self.threshold_table_path:
             self.load_threshold_table(self.threshold_table_path)
         if self.target_fractions is not None:
@@ -276,21 +353,52 @@ class AdaptiveMPConfig:
         self.layer_buckets = int(payload.get("layer_buckets", 1))
         self.operator_default_thresholds = {}
         self.bucket_thresholds = {}
+        self.operator_default_stoc_len_levels = {}
+        self.bucket_stoc_len_levels = {}
+        self.operator_default_escape_thresholds = {}
+        self.bucket_escape_thresholds = {}
 
         for operator, operator_payload in payload.get("operator_defaults", {}).items():
+            op_levels = _extract_group_levels(
+                operator_payload, f"operator_default:{operator}")
+            if op_levels is not None:
+                self.operator_default_stoc_len_levels[operator] = op_levels
             self.operator_default_thresholds[operator] = _extract_thresholds(
                 operator_payload,
-                len(self.stoc_len_levels),
+                len(op_levels if op_levels is not None
+                    else self.stoc_len_levels),
                 f"operator_default:{operator}",
             )
+            escape_threshold = self._escape_threshold_from_payload(
+                operator_payload)
+            if escape_threshold is not None:
+                self.operator_default_escape_thresholds[operator] = (
+                    escape_threshold)
 
         for bucket_key, bucket_payload in payload.get("buckets", {}).items():
             operator, t_bucket, l_bucket = _parse_bucket_key(bucket_key)
+            group_levels = _extract_group_levels(bucket_payload, bucket_key)
+            if group_levels is not None:
+                self.bucket_stoc_len_levels[
+                    (operator, t_bucket, l_bucket)] = group_levels
             self.bucket_thresholds[(operator, t_bucket, l_bucket)] = _extract_thresholds(
                 bucket_payload,
-                len(self.stoc_len_levels),
+                len(group_levels if group_levels is not None
+                    else self.stoc_len_levels),
                 bucket_key,
             )
+            escape_threshold = self._escape_threshold_from_payload(
+                bucket_payload)
+            if escape_threshold is not None:
+                self.bucket_escape_thresholds[
+                    (operator, t_bucket, l_bucket)] = escape_threshold
+
+        if self.escape_gate_k is not None and not (
+                self.bucket_escape_thresholds
+                or self.operator_default_escape_thresholds):
+            raise ValueError(
+                f"escape_gate_k={self.escape_gate_k} is set but the threshold "
+                f"table {path} has no metric_mean/metric_std statistics")
 
         # Optional protected-channel section (exported by the LLM/CNN
         # calibrators' --protect-channel-frac path). Keys are "op:b<N>" or
@@ -316,6 +424,21 @@ class AdaptiveMPConfig:
                     unit_idx = int(parts[2][1:])
                 self.protected_channels[(operator, block_idx, unit_idx)] = [
                     int(i) for i in indices]
+
+        self.dispatch_metrics = {}
+        for operator, spec in (payload.get("dispatch_metrics") or {}).items():
+            name = str(spec.get("metric", "amax"))
+            if name not in ROW_METRIC_NAMES:
+                raise ValueError(
+                    f"Adaptive MP table dispatch_metrics[{operator}] names "
+                    f"unknown metric {name!r} (expected one of "
+                    f"{ROW_METRIC_NAMES}).")
+            sign = float(spec.get("sign", 1.0))
+            if sign == 0.0:
+                raise ValueError(
+                    f"Adaptive MP table dispatch_metrics[{operator}] has "
+                    "zero sign; expected a positive or negative value.")
+            self.dispatch_metrics[operator] = (name, sign)
 
     def get_protected_channels(
         self,
@@ -356,6 +479,91 @@ class AdaptiveMPConfig:
             return self.operator_default_thresholds[operator]
         return None
 
+    def get_levels(
+        self,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        total_blocks: Optional[int] = None,
+    ) -> list[int]:
+        """Return the ladder for the same bucket used by ``get_thresholds``."""
+        if (self.bucket_stoc_len_levels and operator
+                and block_idx is not None and total_blocks is not None):
+            t_bucket = _bucket_index(
+                timestep, total_timesteps, self.timestep_buckets)
+            l_bucket = _bucket_index(
+                block_idx, total_blocks, self.layer_buckets)
+            levels = self.bucket_stoc_len_levels.get(
+                (operator, t_bucket, l_bucket))
+            if levels is not None:
+                return levels
+        if operator and operator in self.operator_default_stoc_len_levels:
+            return self.operator_default_stoc_len_levels[operator]
+        return self.stoc_len_levels
+
+    def _escape_threshold_from_payload(
+        self, payload,
+    ) -> Optional[float]:
+        if self.escape_gate_k is None or not isinstance(payload, dict):
+            return None
+        mean = payload.get("metric_mean")
+        std = payload.get("metric_std")
+        if mean is None or std is None:
+            return None
+        return float(mean) + float(self.escape_gate_k) * float(std)
+
+    def get_escape_threshold(
+        self,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        total_blocks: Optional[int] = None,
+    ) -> Optional[float]:
+        if self.escape_gate_k is None:
+            return None
+        if (self.bucket_escape_thresholds and operator
+                and block_idx is not None and total_blocks is not None):
+            t_bucket = _bucket_index(
+                timestep, total_timesteps, self.timestep_buckets)
+            l_bucket = _bucket_index(
+                block_idx, total_blocks, self.layer_buckets)
+            threshold = self.bucket_escape_thresholds.get(
+                (operator, t_bucket, l_bucket))
+            if threshold is not None:
+                return threshold
+        if operator and operator in self.operator_default_escape_thresholds:
+            return self.operator_default_escape_thresholds[operator]
+        return None
+
+    def classify_level_values(
+        self,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        total_blocks: Optional[int] = None,
+    ) -> list[int]:
+        """Level-index to stoc_len map, including an off-ladder escape rung."""
+        levels = self.get_levels(
+            timestep=timestep,
+            total_timesteps=total_timesteps,
+            operator=operator,
+            block_idx=block_idx,
+            total_blocks=total_blocks,
+        )
+        if (self.escape_gate_k is None
+                or int(self.escape_stoc_len) in levels):
+            return levels
+        return list(levels) + [int(self.escape_stoc_len)]
+
+    def get_dispatch_metric(self, operator: Optional[str]) -> tuple[str, float]:
+        """Return ``(metric_name, sign)`` for one operator's row dispatch."""
+        if operator and self.dispatch_metrics:
+            return self.dispatch_metrics.get(operator, ("amax", 1.0))
+        return ("amax", 1.0)
+
 
 def adaptive_classify_rows(
     metric: torch.Tensor,
@@ -385,7 +593,13 @@ def adaptive_classify_rows(
         RowAssignment compatible with existing dispatch code.
     """
     N = metric.shape[0]
-    levels = config.stoc_len_levels
+    levels = config.get_levels(
+        timestep=timestep,
+        total_timesteps=total_timesteps,
+        operator=operator,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+    )
     n_levels = len(levels)
 
     # Empty row batch — e.g. a MoE expert that received ZERO tokens this forward
@@ -454,7 +668,19 @@ def adaptive_classify_rows(
         total_blocks=total_blocks,
     )
     if calibrated_thresholds is not None:
-        return _classify_rows_by_thresholds(metric_norm, levels, calibrated_thresholds)
+        assignment = _classify_rows_by_thresholds(
+            metric_norm, levels, calibrated_thresholds)
+        _apply_escape_gate(
+            assignment,
+            metric_norm,
+            config,
+            operator=operator,
+            block_idx=block_idx,
+            total_blocks=total_blocks,
+            timestep=timestep,
+            total_timesteps=total_timesteps,
+        )
+        return assignment
 
     # No path matched (not free-boundary, no target_fractions, and no
     # calibrated thresholds for this operator/bucket). There is no closed-form
@@ -466,6 +692,50 @@ def adaptive_classify_rows(
         f"operator_default). Re-run calibration covering this operator/layer, "
         f"or set target_fractions."
     )
+
+
+def _apply_escape_gate(
+    assignment: RowAssignment,
+    metric_norm: torch.Tensor,
+    config: AdaptiveMPConfig,
+    *,
+    operator: Optional[str],
+    block_idx: Optional[int],
+    total_blocks: Optional[int],
+    timestep: int,
+    total_timesteps: int,
+) -> None:
+    """Move calibration-space outliers to the configured escape precision."""
+    threshold = config.get_escape_threshold(
+        timestep=timestep,
+        total_timesteps=total_timesteps,
+        operator=operator,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+    )
+    if threshold is None or threshold >= 1.0:
+        return
+    escape_mask = metric_norm > metric_norm.new_tensor(threshold)
+    if not bool(escape_mask.any().item()):
+        return
+    levels = config.get_levels(
+        timestep=timestep,
+        total_timesteps=total_timesteps,
+        operator=operator,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+    )
+    escape_stoc_len = int(config.escape_stoc_len)
+    escape_index = (
+        levels.index(escape_stoc_len)
+        if escape_stoc_len in levels else len(levels))
+    assignment.row_levels[escape_mask] = escape_index
+    for level_index, stoc_len in enumerate(levels):
+        assignment.level_row_indices[stoc_len] = torch.where(
+            assignment.row_levels == level_index)[0]
+    if escape_index == len(levels):
+        assignment.level_row_indices[escape_stoc_len] = torch.where(
+            escape_mask)[0]
 
 
 # =====================================================================

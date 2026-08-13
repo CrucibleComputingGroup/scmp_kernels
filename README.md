@@ -11,6 +11,7 @@ scmp_kernels/
 ├── sc/             # Stochastic-computing matmul kernels (Triton)   ← migrated
 ├── quant/          # FP → int quantization for the SC kernels       ← migrated
 ├── mp/             # Mixed-precision config + row/group classifiers  ← migrated
+├── trace.py        # Per-call SC precision/shape trace for HW models
 ├── qwt/            # QwT compensation                                (placeholder)
 └── sensitivity/    # Per-(op, block) sensitivity tools               (placeholder)
 ```
@@ -137,6 +138,20 @@ per-row / per-group `stoc_len` assignment: `MPConfig`, `AdaptiveMPConfig`,
 `RangeMPConfig`, `RowAssignment`, `classify_rows_by_metric`,
 `adaptive_classify_rows`, `classify_groups_by_range`, plus the
 `MPDistributionLogger` / `MetricProfiler` instrumentation helpers.
+Adaptive calibration tables may include `dispatch_metrics` to choose signed
+`amax`, `l2`, or `crest` row ranking per operator; use
+`compute_row_metric` when building compatible calibration surfaces.
+
+## Precision trace and cache bound
+
+Set `SC_MP_TRACE=/path/out.json` to summarize every `sc_matmul` call by
+operator context, shape, effective `stoc_len`, MACs, and row cycles. Set
+`SC_MP_TRACE_MODE=trace` for ordered JSONL instead, or use
+`scmp_kernels.trace.enable()/flush()` from Python. Applications can tag calls
+with `trace.set_context(op, block, unit)`.
+
+Enable-table and k-table caches use LRU eviction. Their default maximum is 32
+entries and can be changed before import with `SC_ENABLE_TABLE_CACHE_MAX`.
 
 ## QwT / Sensitivity
 

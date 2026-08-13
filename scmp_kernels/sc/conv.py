@@ -31,6 +31,7 @@ excludes them from the budget for consistency.
 """
 from __future__ import annotations
 
+import inspect
 from typing import Callable, Optional, Sequence, Union
 
 import torch
@@ -56,6 +57,33 @@ def _out_hw(H, W, kHW, sHW, pHW, dHW) -> tuple[int, int]:
     return Hout, Wout
 
 
+def _call_mp_logger(
+    logger: Optional[Callable[..., None]],
+    stoc_len: int,
+    n_rows: int,
+    feature_fraction: float,
+) -> None:
+    """Call both the historical 2-arg and new feature-aware logger forms."""
+    if logger is None:
+        return
+    try:
+        params = inspect.signature(logger).parameters.values()
+        accepts_fraction = (
+            any(param.kind == inspect.Parameter.VAR_POSITIONAL
+                for param in params)
+            or sum(param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ) for param in params) >= 3
+        )
+    except (TypeError, ValueError):
+        accepts_fraction = False
+    if accepts_fraction:
+        logger(stoc_len, n_rows, feature_fraction)
+    else:
+        logger(stoc_len, n_rows)
+
+
 def _mp_dispatch_rows(
     a: torch.Tensor,
     w: torch.Tensor,
@@ -68,7 +96,8 @@ def _mp_dispatch_rows(
     mp_operator: Optional[str] = None,
     mp_block_idx: Optional[int] = None,
     mp_total_blocks: Optional[int] = None,
-    mp_logger: Optional[Callable[[int, int], None]] = None,
+    mp_logger: Optional[Callable[..., None]] = None,
+    mp_metric_logger: Optional[Callable[..., None]] = None,
 ) -> torch.Tensor:
     """Per-row mixed-precision matmul: classify each lowered row of ``a`` by
     its abs-max, then call ``sc_matmul`` once per stoc_len level on that
@@ -83,27 +112,54 @@ def _mp_dispatch_rows(
     plain ``sc_conv2d(mp_config=...)`` call (fixed-fraction MPConfig or an
     AdaptiveMPConfig quantile / per-op-default) still works.
 
-    ``mp_logger(stoc_len, n_rows)`` is invoked once per non-empty level so the
-    caller can accumulate the realized (row / MAC weighted) average stream
-    length without this module depending on any tracker.
+    ``mp_logger(stoc_len, n_rows[, feature_fraction])`` is invoked once per
+    non-empty level so the caller can accumulate the realized (row / MAC
+    weighted) average stream length without this module depending on a
+    tracker. The historical two-argument callback remains supported.
     """
     from ..mp.config import (            # local import: mp never imports sc,
         AdaptiveMPConfig,                # but keep the coupling one-way anyway
         MPConfig,
         adaptive_classify_rows,
         classify_rows_by_metric,
+        compute_row_metric,
     )
 
     operator = mp_operator if mp_operator is not None else default_operator
-    metric = a.abs().amax(dim=-1)
+    protected_idx = torch.empty(0, dtype=torch.long, device=a.device)
+    residual_idx = None
     if isinstance(mp_config, AdaptiveMPConfig):
+        protected = mp_config.get_protected_channels(
+            operator=operator, block_idx=mp_block_idx, unit_idx=None)
+        protected = sorted({int(i) for i in protected
+                            if 0 <= int(i) < a.shape[1]})
+        if protected:
+            protected_idx = torch.tensor(
+                protected, dtype=torch.long, device=a.device)
+            mask = torch.ones(a.shape[1], dtype=torch.bool, device=a.device)
+            mask[protected_idx] = False
+            residual_idx = mask.nonzero(as_tuple=True)[0]
+        metric_source = (a if residual_idx is None
+                         else a.index_select(1, residual_idx))
+        metric_name, metric_sign = mp_config.get_dispatch_metric(operator)
+        metric = (compute_row_metric(metric_source, metric_name)
+                  if metric_source.shape[1]
+                  else torch.zeros(a.shape[0], device=a.device))
+        if metric_sign < 0:
+            metric = -metric
         assignment = adaptive_classify_rows(
             metric, mp_config,
             operator=operator,
             block_idx=mp_block_idx,
             total_blocks=mp_total_blocks,
         )
+        if mp_metric_logger is not None:
+            residual_fraction = (
+                float(metric_source.shape[1]) / float(a.shape[1])
+                if a.shape[1] else 0.0)
+            mp_metric_logger(metric, residual_fraction)
     elif isinstance(mp_config, MPConfig):
+        metric = a.abs().amax(dim=-1)
         assignment = classify_rows_by_metric(
             metric, mp_config.stoc_len_levels, mp_config.level_fractions)
     else:
@@ -114,18 +170,39 @@ def _mp_dispatch_rows(
     out = torch.zeros((a.shape[0], w.shape[0]),
                       dtype=torch.float32, device=a.device)
     mm_level = dict(mm)
+    if protected_idx.numel() > 0:
+        protected_sl = int(mp_config.protected_channel_stoc_len
+                           or max(mp_config.stoc_len_levels))
+        a_protected = a.index_select(1, protected_idx).contiguous()
+        w_protected = w.index_select(1, protected_idx).contiguous()
+        mm_level["stoc_len"] = protected_sl
+        out += sc_matmul(
+            a_protected, w_protected, granularity=granularity,
+            chunk_d=chunk_d, **mm_level)
+        _call_mp_logger(
+            mp_logger,
+            protected_sl,
+            int(a.shape[0]),
+            float(protected_idx.numel()) / float(a.shape[1]),
+        )
+        a_dispatch = a.index_select(1, residual_idx).contiguous()
+        w_dispatch = w.index_select(1, residual_idx).contiguous()
+        residual_fraction = float(residual_idx.numel()) / float(a.shape[1])
+    else:
+        a_dispatch, w_dispatch = a, w
+        residual_fraction = 1.0
     for sl, indices in assignment.level_row_indices.items():
         n = int(indices.numel())
-        if n == 0:
+        if n == 0 or a_dispatch.shape[1] == 0:
             continue
-        if mp_logger is not None:
-            mp_logger(int(sl), n)
+        _call_mp_logger(mp_logger, int(sl), n, residual_fraction)
         if sl <= 0:                       # explicit skip level (prune → zero)
             continue
         mm_level["stoc_len"] = int(sl)
-        a_sub = a.index_select(0, indices).contiguous()
-        out[indices] = sc_matmul(
-            a_sub, w, granularity=granularity, chunk_d=chunk_d, **mm_level)
+        a_sub = a_dispatch.index_select(0, indices).contiguous()
+        out[indices] += sc_matmul(
+            a_sub, w_dispatch, granularity=granularity,
+            chunk_d=chunk_d, **mm_level)
     return out
 
 
@@ -188,7 +265,8 @@ def sc_conv2d(
     mp_operator: Optional[str] = None,
     mp_block_idx: Optional[int] = None,
     mp_total_blocks: Optional[int] = None,
-    mp_logger: Optional[Callable[[int, int], None]] = None,
+    mp_logger: Optional[Callable[..., None]] = None,
+    mp_metric_logger: Optional[Callable[..., None]] = None,
     **sc_kwargs,
 ) -> torch.Tensor:
     """Stochastic-computing 2D convolution ``conv2d(x, weight, bias)``.
@@ -215,8 +293,10 @@ def sc_conv2d(
         mp_operator / mp_block_idx / mp_total_blocks: identity for the
             AdaptiveMPConfig threshold-table lookup (analog of the LLM's
             ``_sc_op_name`` / ``_sc_block_idx``).
-        mp_logger: optional ``f(stoc_len, n_rows)`` callback, called once per
-            dispatched level (realized-budget tracking).
+        mp_logger: optional ``f(stoc_len, n_rows, feature_fraction)`` callback,
+            called once per dispatched level (realized-budget tracking).
+        mp_metric_logger: optional ``f(metric, feature_fraction)`` callback,
+            called once with the signed pre-normalization dispatch metric.
         **sc_kwargs: extra :func:`sc_matmul` kwargs (``group_a``, ``group_b``,
             ``rng_levels``, ``config``, ``smooth_scales``).
 
@@ -256,7 +336,8 @@ def sc_conv2d(
                 a, w, granularity=granularity, chunk_d=chunk_d, mm=mm,
                 mp_config=mp_config, default_operator="pw",
                 mp_operator=mp_operator, mp_block_idx=mp_block_idx,
-                mp_total_blocks=mp_total_blocks, mp_logger=mp_logger)
+                mp_total_blocks=mp_total_blocks, mp_logger=mp_logger,
+                mp_metric_logger=mp_metric_logger)
         else:
             y = sc_matmul(a, w, granularity=granularity, chunk_d=chunk_d, **mm)
         out = y.reshape(B, H, W, Cout).permute(0, 3, 1, 2)
@@ -286,7 +367,8 @@ def sc_conv2d(
                 a, w, granularity=granularity, chunk_d=chunk_d, mm=mm,
                 mp_config=mp_config, default_operator="conv",
                 mp_operator=mp_operator, mp_block_idx=mp_block_idx,
-                mp_total_blocks=mp_total_blocks, mp_logger=mp_logger)
+                mp_total_blocks=mp_total_blocks, mp_logger=mp_logger,
+                mp_metric_logger=mp_metric_logger)
         else:
             y = sc_matmul(a, w, granularity=granularity, chunk_d=chunk_d, **mm)
         out = y.reshape(B, L, Cout).transpose(1, 2).reshape(B, Cout, Hout, Wout)

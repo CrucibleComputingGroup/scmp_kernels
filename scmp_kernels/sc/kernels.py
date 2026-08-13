@@ -25,6 +25,7 @@ import functools
 import json
 import math
 import os
+from collections import OrderedDict as _OrderedDict
 import torch
 import triton
 import triton.language as tl
@@ -589,8 +590,29 @@ def _sc_matmul_per_head_bipolar(
 # Enable-Signal Host Functions
 # =============================================================================
 
-_enable_table_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-_k_table_cache: dict[str, torch.Tensor] = {}
+# Autoregressive decode changes the attention inner dimension at every step.
+# Bound the large per-(D, stoc_len) lookup tables so stale shapes cannot grow
+# GPU memory without limit. Fixed-shape CNN workloads normally never evict.
+_ENABLE_TABLE_CACHE_MAX = int(os.environ.get("SC_ENABLE_TABLE_CACHE_MAX", "32"))
+if _ENABLE_TABLE_CACHE_MAX < 1:
+    raise ValueError("SC_ENABLE_TABLE_CACHE_MAX must be at least 1")
+_enable_table_cache: "_OrderedDict[str, tuple[torch.Tensor, torch.Tensor]]" = _OrderedDict()
+_k_table_cache: "_OrderedDict[str, torch.Tensor]" = _OrderedDict()
+
+
+def _lru_get(cache, key):
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    return None
+
+
+def _lru_put(cache, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _ENABLE_TABLE_CACHE_MAX:
+        cache.popitem(last=False)
+    return value
 
 
 def _resolve_rng_levels(sc_prec: int, rng_levels: Optional[int]) -> int:
@@ -830,11 +852,12 @@ def _get_cached_enable_tables(
         stoc_len = 2 ** sc_prec
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
     key = _enable_table_cache_key(config, sc_prec, device) + f"|sl={stoc_len}|rng={grid_levels}"
-    if key not in _enable_table_cache:
-        _enable_table_cache[key] = build_enable_tables(
-            rng_a, rng_b, sc_prec, stoc_len, rng_levels=grid_levels
-        )
-    return _enable_table_cache[key]
+    cached = _lru_get(_enable_table_cache, key)
+    if cached is not None:
+        return cached
+    return _lru_put(_enable_table_cache, key, build_enable_tables(
+        rng_a, rng_b, sc_prec, stoc_len, rng_levels=grid_levels
+    ))
 
 
 def _get_cached_k_table(
@@ -848,11 +871,12 @@ def _get_cached_k_table(
         stoc_len = 2 ** sc_prec
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
     key = _enable_table_cache_key(config, sc_prec, device) + f"|k_only|sl={stoc_len}|rng={grid_levels}"
-    if key not in _k_table_cache:
-        _k_table_cache[key] = build_k_table_only(
-            rng_a, sc_prec, stoc_len, rng_levels=grid_levels
-        )
-    return _k_table_cache[key]
+    cached = _lru_get(_k_table_cache, key)
+    if cached is not None:
+        return cached
+    return _lru_put(_k_table_cache, key, build_k_table_only(
+        rng_a, sc_prec, stoc_len, rng_levels=grid_levels
+    ))
 
 
 def enable_matmul_triton(
