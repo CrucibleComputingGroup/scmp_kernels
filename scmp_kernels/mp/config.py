@@ -801,7 +801,22 @@ def _apply_escape_gate(
     esc_mask = metric_norm > metric_norm.new_tensor(t_esc)
     if not bool(esc_mask.any().item()):
         return
-    levels = config.stoc_len_levels
+    # MUST be the ladder that produced ``assignment`` — i.e. the bucket's own
+    # ladder when the table declares per-group ones — NOT the global list.
+    # ``_classify_rows_by_thresholds`` keyed ``level_row_indices`` by the
+    # BUCKET ladder's stoc_len values; rebuilding the map against the global
+    # ladder below re-keys every rung, so rows silently run at the global
+    # ladder's stream lengths while their level indices still point at the
+    # bucket's. With ladders of equal length nothing raises — it surfaces only
+    # as a realized-cost reconciliation failure, the same failure mode
+    # ``classify_level_values`` documents for the index->length map.
+    levels = config.get_levels(
+        timestep=timestep,
+        total_timesteps=total_timesteps,
+        operator=operator,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+    )
     esc_sl = int(config.escape_stoc_len)
     esc_idx = levels.index(esc_sl) if esc_sl in levels else len(levels)
     assignment.row_levels[esc_mask] = esc_idx
