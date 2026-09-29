@@ -1,0 +1,14 @@
+[PASS] test_accumulate_act_scales
+[PASS] test_compute_smooth_scales_basic
+[PASS] test_apply_smoothing_math_identity
+[PASS] test_apply_smoothing_3d
+  MSE plain  = 8.939e-01
+  MSE smooth = 5.427e-02
+  ratio      = 16.5x
+[PASS] test_outlier_mse_improvement
+[PASS] test_apply_smoothing_offline_round_trip
+[PASS] test_invalid_args
+  [skip] no CUDA
+[PASS] test_sc_matmul_kwarg_wiring_cuda
+
+All 8 tests passed.
