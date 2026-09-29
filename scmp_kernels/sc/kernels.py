@@ -177,12 +177,14 @@ def compute_k_table_kernel(
 @triton.jit
 def enable_matmul_tiled_kernel(
     cum_ptr,           # (D, stoc_len+1, V) int16
-    k_table_ptr,       # (D, V) int16
+    k_table_ptr,       # (D, V) int16, or (R, D, V) when PER_ROW_LEN
     boundary_a_ptr,    # (D, N) int16 — transposed for coalesced access
     boundary_b_ptr,    # (D, M) int16 — transposed for coalesced access
     sign_a_ptr,        # (D, N) int8 — only read when IS_BIPOLAR
     sign_b_ptr,        # (D, M) int8 — only read when IS_BIPOLAR
     output_ptr,        # (N, M) float32
+    rung_ptr,          # (N,) int32 — per-row rung, only read when PER_ROW_LEN
+    row_scale_ptr,     # (R,) float32 = q_max_sq / L_r, only when PER_ROW_LEN
     N, M, D,
     stoc_len: tl.constexpr,
     V: tl.constexpr,
@@ -191,6 +193,7 @@ def enable_matmul_tiled_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     IS_BIPOLAR: tl.constexpr,
+    PER_ROW_LEN: tl.constexpr = False,
 ):
     """Tiled enable-signal matmul.
 
@@ -199,6 +202,21 @@ def enable_matmul_tiled_kernel(
     ``IS_BIPOLAR`` selects sign-magnitude (loads sa/sb, with all-zero skip)
     vs asymmetric (no sign loads). Sign pointers are only read when
     ``IS_BIPOLAR`` is True; pass any valid dummy tensor in the unipolar path.
+
+    ``PER_ROW_LEN`` gives every ROW of ``a`` its own stream length for THIS
+    call, which is what makes per-(row, chunk) mixed precision possible. It is
+    nearly free because the enable formulation never loops over cycles: the
+    inner loop runs over D and reads cum in O(1), so the work is identical at
+    every length. Only two things depend on the length:
+
+      * ``k_table[d, ba]`` = #{t < L : rng_a[d,t] <= ba}, which becomes a
+        (R, D, V) stack, one slice per rung, selected by a per-row offset;
+      * the trailing ``q_max_sq / L`` scale, which becomes a per-row vector.
+
+    ``cum`` needs NO per-length variant. cum[d, k, v] = |{i < k : rng_b[d,i]
+    <= v}| is a prefix sum over the cycle axis and the Owen scramble is a
+    position-independent per-dim XOR, so the length-L table IS the first L
+    rows of the L_max table. One table serves every rung.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -212,6 +230,11 @@ def enable_matmul_tiled_kernel(
     cum_stride_d = (stoc_len + 1) * V
     scale = q_max_sq / stoc_len
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    if PER_ROW_LEN:
+        # (BLOCK_M,) base offset into the (R, D, V) k_table stack.
+        rung = tl.load(rung_ptr + m_offsets, mask=m_mask, other=0).to(tl.int64)
+        k_base = rung * (D * V)
 
     num_k_blocks = (D + BLOCK_K - 1) // BLOCK_K
     for k_block in range(num_k_blocks):
@@ -229,7 +252,10 @@ def enable_matmul_tiled_kernel(
                             sb = sb_i8.to(tl.float32)
                             ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
                             bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
-                            k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                            if PER_ROW_LEN:
+                                k_vals = tl.load(k_table_ptr + k_base + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                            else:
+                                k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
                             cum_offsets = (d * cum_stride_d
                                            + k_vals[:, None].to(tl.int64) * V
                                            + bb[None, :].to(tl.int64))
@@ -238,15 +264,23 @@ def enable_matmul_tiled_kernel(
                 else:
                     ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
                     bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
-                    k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                    if PER_ROW_LEN:
+                        k_vals = tl.load(k_table_ptr + k_base + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                    else:
+                        k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
                     cum_offsets = (d * cum_stride_d
                                    + k_vals[:, None].to(tl.int64) * V
                                    + bb[None, :].to(tl.int64))
                     counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
                     acc += counts
 
-    # Apply loop-invariant scale once (enables FMA fusion in the inner loop)
-    acc *= scale
+    # Apply loop-invariant scale once (enables FMA fusion in the inner loop).
+    # Per-row lengths make it a per-row vector; q_max_sq / L_r is precomputed
+    # host-side so the kernel never divides.
+    if PER_ROW_LEN:
+        acc *= tl.load(row_scale_ptr + rung, mask=m_mask, other=0.0)[:, None]
+    else:
+        acc *= scale
 
     out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
     out_mask = m_mask[:, None] & n_mask[None, :]
@@ -697,7 +731,16 @@ def _bit_reverse(x: torch.Tensor, n_bits: int) -> torch.Tensor:
 # mask selector). This is the BINDING cap — M cannot exceed it in silicon, so
 # requesting more (e.g. SC_SCRAMBLE_MASKS=256) is a simulation-only "ideal" and
 # is clamped here rather than silently pretending the hardware could do it.
+# SC_HW_MAX_MASKS overrides the cap for SIMULATION-ONLY ablations (e.g. testing
+# whether M=64 mask reuse across the RoPE pair d/d+64 with head_dim=128 costs
+# quality). Any run with SC_HW_MAX_MASKS set is NOT hardware-realizable at that
+# M and must be labeled as an ideal/ablation row, never a deployed cell.
 HW_MAX_MASKS = 64
+
+
+def _hw_max_masks() -> int:
+    raw = os.environ.get("SC_HW_MAX_MASKS", "").strip()
+    return int(raw) if raw else HW_MAX_MASKS
 
 
 def _scramble_mask_count(base_levels: int) -> int:
@@ -714,11 +757,12 @@ def _scramble_mask_count(base_levels: int) -> int:
     if k <= 0:
         raise ValueError(
             f"SC_SCRAMBLE_MASKS must be a positive power of two, got {k}.")
-    m = min(k, HW_MAX_MASKS, base_levels)
+    cap = _hw_max_masks()
+    m = min(k, cap, base_levels)
     if m & (m - 1):
         raise ValueError(
             f"SC_SCRAMBLE_MASKS must be a power of two, got {k} "
-            f"(effective M={m} after min with HW_MAX_MASKS={HW_MAX_MASKS}, "
+            f"(effective M={m} after min with HW_MAX_MASKS={cap}, "
             f"base_levels={base_levels}).")
     return m
 
@@ -961,6 +1005,33 @@ def _get_cached_k_table(
     ))
 
 
+def _get_cached_k_table_stack(
+    config: dict, sc_prec: int, device: torch.device,
+    rng_a: torch.Tensor,
+    level_lens,
+    rng_levels: Optional[int] = None,
+) -> torch.Tensor:
+    """(R, D, V) stack of k_tables, one slice per rung length.
+
+    Per-ROW stream lengths need ``k_table[d, ba]`` evaluated at each rung's
+    length. It is a count over the first L cycles, so there is one slice per
+    distinct L and no way to share them the way ``cum`` is shared. That costs
+    almost nothing: R x D x V int16 is ~320 KB at R=5, D=128, V=256, which is
+    L2-resident, so the per-row gather stays cheap.
+    """
+    grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
+    lens = tuple(int(v) for v in level_lens)
+    key = (_enable_table_cache_key(config, sc_prec, device)
+           + f"|k_stack|sl={lens}|rng={grid_levels}")
+    cached = _lru_get(_k_table_cache, key)
+    if cached is not None:
+        return cached
+    stack = torch.stack(
+        [build_k_table_only(rng_a, sc_prec, L, rng_levels=grid_levels)
+         for L in lens], dim=0).contiguous()
+    return _lru_put(_k_table_cache, key, stack)
+
+
 def enable_matmul_triton(
     cum_indicator: torch.Tensor,
     k_table: torch.Tensor,
@@ -1025,6 +1096,7 @@ def enable_matmul_triton(
         boundary_a, boundary_b,
         sign_a, sign_b,
         output,
+        output, output,          # rung / row_scale unused (PER_ROW_LEN=False)
         N, M, D, stoc_len, V,
         q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
         IS_BIPOLAR=is_bipolar,
@@ -1205,6 +1277,7 @@ def enable_matmul_compact_mlp(
             ba_chunk, bb_chunk,
             sa_chunk, sb_chunk,
             partial,
+            partial, partial,    # rung / row_scale unused (PER_ROW_LEN=False)
             N, M, d_len, stoc_len, V,
             q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
             IS_BIPOLAR=is_bipolar,
@@ -1442,6 +1515,10 @@ def _sc_matmul_bipolar_mlp_chunked(
     stoc_len=None,
     rng_levels: Optional[int] = None,
     cum_cache_key: Optional[str] = None,
+    rung_table: Optional[torch.Tensor] = None,
+    level_lens=None,
+    config: Optional[dict] = None,
+    rng_a: Optional[torch.Tensor] = None,
 ):
     """
     Bipolar SC matmul for MLP with internal chunk_d loop.
@@ -1449,12 +1526,25 @@ def _sc_matmul_bipolar_mlp_chunked(
     Handles the entire D-chunking internally, replacing the Python loop in
     sc_mlp.py. Key optimizations vs calling _sc_matmul_per_row_mlp in a loop:
     - Build cum_indicator ONCE (all chunks share same config/RNG)
-    - Use fused per-row quant kernel (1 launch vs ~12 PyTorch ops per chunk)
+    - Use fused per-row quant kernel (1 launch vs ~12 PyTorch ops each)
     - No .item() GPU sync calls (bipolar doesn't need max/min)
     - Minimal Python overhead per chunk
 
     Total kernel launches: 1 (build) + num_chunks * 3 (quant_a + quant_b + matmul)
     vs old: num_chunks * ~38 launches + 4 syncs each
+
+    PER-(ROW, CHUNK) MIXED PRECISION
+    --------------------------------
+    ``rung_table`` is an (N, num_chunks) int32 tensor giving every (row, chunk)
+    its own rung into ``level_lens``; ``stoc_len`` is then the MAXIMUM length
+    and is used only to size the shared cum table. This costs no extra kernel
+    launches, because the D-chunk loop below is ALREADY one launch per chunk --
+    per-chunk lengths are just a different slice per iteration -- and no extra
+    FLOPs, because the enable formulation never loops over cycles.
+
+    The dispatch statistic is likewise already here: ``scale_a`` returned by
+    ``fused_quantize_bipolar_perrow`` on each chunk IS the per-(row, chunk)
+    absmax, so a caller can allocate on it without any additional reduction.
     """
     N, D = a.shape
     M = b.shape[0]
@@ -1463,6 +1553,55 @@ def _sc_matmul_bipolar_mlp_chunked(
     q_max = 2 ** (sc_prec - 1) - 1
     q_max_sq = float(q_max * q_max)
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
+
+    per_row_len = rung_table is not None
+    if per_row_len:
+        if level_lens is None or len(level_lens) == 0:
+            raise ValueError("rung_table requires level_lens")
+        n_chunks_expected = (D + chunk_d - 1) // chunk_d
+        if tuple(rung_table.shape) != (N, n_chunks_expected):
+            raise ValueError(
+                f"rung_table must be (N, num_chunks) = ({N}, "
+                f"{n_chunks_expected}), got {tuple(rung_table.shape)}")
+        lens = [int(v) for v in level_lens]
+        if max(lens) > stoc_len:
+            # cum is built at stoc_len; a longer rung would index past it.
+            raise ValueError(
+                f"level_lens max {max(lens)} exceeds stoc_len {stoc_len}")
+        if min(lens) < 1:
+            raise ValueError(f"level_lens must be >= 1, got {min(lens)}")
+        rung_table = rung_table.to(device=a.device, dtype=torch.int32).contiguous()
+        # Guard the gather: an out-of-range rung silently reads a neighbouring
+        # k_table slice, which is a WRONG stream length rather than a crash.
+        rmax = int(rung_table.max().item())
+        if rmax >= len(lens) or int(rung_table.min().item()) < 0:
+            raise ValueError(
+                f"rung_table values must lie in [0, {len(lens) - 1}]")
+        if config is None or rng_a is None:
+            raise ValueError("per-row lengths need config and rng_a to build "
+                             "the k_table stack")
+        # Sharing ONE cum table across rungs relies on prefix nesting: the
+        # length-L table must be the first L rows of the L_max table. That
+        # holds because the Owen scramble is a position-independent per-dim
+        # XOR -- but only if it is applied at BOTH lengths. In the fixed-level
+        # path `_prepare_rng_prefix` scrambles only when is_prefix is true, so
+        # at stoc_len == 2**sc_prec the L_max table is UNSCRAMBLED while every
+        # shorter rung would be scrambled. Nesting silently fails there and
+        # every rung below L_max returns a subtly wrong (not crashing) result.
+        # The deployed config (halve=1 => grid_levels=128 != base=256) always
+        # takes the rescale path, which always scrambles, so this never fires
+        # in practice -- but it must not fail quietly if it ever does.
+        if max_rng_val == 2 ** sc_prec and stoc_len >= 2 ** sc_prec:
+            raise ValueError(
+                f"per-row lengths need a scrambled RNG prefix at stoc_len; "
+                f"got stoc_len={stoc_len} == 2**sc_prec with "
+                f"rng_levels={max_rng_val} (fixed-level path), where the "
+                f"L_max table is unscrambled and cum no longer nests. Use "
+                f"stoc_len < {2 ** sc_prec} or a coarser rng_levels.")
+        k_stack = _get_cached_k_table_stack(
+            config, sc_prec, a.device, rng_a, lens, rng_levels=max_rng_val)
+        row_scale = torch.tensor(
+            [q_max_sq / L for L in lens], dtype=torch.float32, device=a.device)
 
     V = k_table.shape[1]
     device = a.device
@@ -1505,7 +1644,7 @@ def _sc_matmul_bipolar_mlp_chunked(
 
     # Per-row scale accumulators for dequantization
     # Each chunk has its own per-row scales; we accumulate via outer product
-    for d_start in range(0, D, chunk_d):
+    for ci, d_start in enumerate(range(0, D, chunk_d)):
         d_end = min(d_start + chunk_d, D)
         d_len = d_end - d_start
 
@@ -1529,10 +1668,11 @@ def _sc_matmul_bipolar_mlp_chunked(
                 rng_b_chunk, cum_chunk,
                 d_len, stoc_len, V,
             )
-            k_tab_chunk = k_table[:d_len].contiguous()
+            k_tab_chunk = (k_stack[:, :d_len, :].contiguous() if per_row_len
+                           else k_table[:d_len].contiguous())
         else:
             cum_chunk = cum_indicator
-            k_tab_chunk = k_table
+            k_tab_chunk = k_stack if per_row_len else k_table
 
         # Transpose boundary/sign to (D, N/M) for coalesced kernel access
         boundary_a_t = boundary_a.t().contiguous()
@@ -1540,15 +1680,21 @@ def _sc_matmul_bipolar_mlp_chunked(
         sign_a_t = sign_a.t().contiguous()
         sign_b_t = sign_b.t().contiguous()
 
+        # This chunk's per-row rungs. One slice per iteration -- the whole
+        # reason per-(row, chunk) costs no extra launches.
+        rung_chunk = rung_table[:, ci].contiguous() if per_row_len else partial
+
         # Fast tiled matmul with O(1) cum_indicator lookup
         enable_matmul_tiled_kernel[grid_mm](
             cum_chunk, k_tab_chunk,
             boundary_a_t, boundary_b_t,
             sign_a_t, sign_b_t,
             partial,
+            rung_chunk, row_scale if per_row_len else partial,
             N, M, d_len, stoc_len, V,
             q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
             IS_BIPOLAR=True,
+            PER_ROW_LEN=per_row_len,
             num_warps=nw,
         )
 
@@ -1631,6 +1777,8 @@ def _sc_matmul_per_row_mlp(
     chunk_d: int = 0,
     stoc_len: Optional[int] = None,
     rng_levels: Optional[int] = None,
+    rung_table: Optional[torch.Tensor] = None,
+    level_lens=None,
 ) -> torch.Tensor:
     """
     Enable-signal SC matmul for MLP layers.
@@ -1642,10 +1790,19 @@ def _sc_matmul_per_row_mlp(
                  quantization (~10x fewer kernel launches vs external loop).
         group_a: rows per quantization group for a (1 = per-row, default).
         group_b: rows per quantization group for b (1 = per-row/per-channel, default).
-        stoc_len: Stochastic stream length. If None, uses 2^sc_prec.
+        stoc_len: Stochastic stream length. If None, uses 2^sc_prec. With
+                  ``rung_table`` set this is the MAXIMUM length (it sizes the
+                  shared cum table); each (row, chunk) runs its own.
+        rung_table: (N, num_chunks) int32 per-(row, chunk) index into
+                    ``level_lens``. Requires the bipolar chunked fast path.
+        level_lens: the stream length for each rung.
     """
     if stoc_len is None:
         stoc_len = 2 ** sc_prec
+    if rung_table is not None and not (mode == "bipolar" and chunk_d > 0):
+        raise ValueError(
+            "rung_table (per-(row, chunk) lengths) requires mode='bipolar' "
+            f"with chunk_d > 0; got mode={mode!r}, chunk_d={chunk_d}")
 
     if max_fp_b is None:
         max_fp_b = max_fp_a
@@ -1653,6 +1810,10 @@ def _sc_matmul_per_row_mlp(
         min_fp_b = min_fp_a
 
     if a.dim() == 3:
+        if rung_table is not None:
+            raise ValueError(
+                "rung_table is not supported on the batched 3D path; call "
+                "per 2D slice so each has its own (N, num_chunks) table")
         return _sc_matmul_enable_triton_mlp_batched(
             a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b,
             mode, sc_prec, config, stoc_len=stoc_len, rng_levels=rng_levels
@@ -1694,11 +1855,22 @@ def _sc_matmul_per_row_mlp(
                 # rng_b is post-scramble (_prepare_rng_prefix), so the
                 # scramble params must be in the key (same fix as #28).
                 + _scramble_cache_tag(sc_prec, stoc_len, grid_levels)),
+            rung_table=rung_table, level_lens=level_lens,
+            config=config, rng_a=rand_seqs_a_t,
         )
 
         if device.type != 'cuda':
             result = result.to(device)
         return result
+
+    # Per-(row, chunk) lengths exist only on the bipolar chunked fast path
+    # above. Falling through to here would SILENTLY run one uniform stoc_len
+    # for every row -- an allocation the caller did not ask for, and one that
+    # still reports the right average cost, so it would not show up as a bug.
+    if rung_table is not None:
+        raise ValueError(
+            f"rung_table needs the bipolar chunked fast path (mode='bipolar', "
+            f"0 < chunk_d < D); got mode={mode!r}, chunk_d={chunk_d}, D={D}")
 
     # Standard path (no chunk_d, or unipolar, or D <= chunk_d)
     if config is None:
