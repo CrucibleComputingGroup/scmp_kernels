@@ -14,6 +14,8 @@ behind an explicit ``a_observer=`` kwarg if ever needed.
 
 from __future__ import annotations
 
+import functools
+import contextlib
 from typing import Optional
 
 import torch
@@ -39,8 +41,52 @@ _CPU_METHOD_NAMES = {
 }
 
 
+def _pin_to_operand_device(fn):
+    """Run the SC matmul on the operands' CUDA device.
+
+    Triton kernel launches and scratch-tensor allocations target the *current*
+    CUDA device, not the device the operands live on. When ``sc_matmul`` is
+    called with inputs on a non-default GPU — e.g. a layer placed on ``cuda:1``
+    by ``device_map="auto"`` — kernels would otherwise launch on ``cuda:0``,
+    causing an illegal cross-device access (chunked MLP path) or silently wrong
+    results (other paths). Pin the current device to ``a.device`` for the call;
+    the previous device is restored on exit.
+    """
+    @functools.wraps(fn)
+    def wrapper(a, b, *args, **kwargs):
+        if a.device != b.device:
+            raise ValueError(
+                f"sc_matmul: a and b must be on the same device, got a.device={a.device}, b.device={b.device}."
+            )
+        if a.is_cuda:
+            with torch.cuda.device(a.device):
+                return fn(a, b, *args, **kwargs)
+        return fn(a, b, *args, **kwargs)
+    return wrapper
+
+
+@_pin_to_operand_device
 @torch.no_grad()
-def sc_matmul(
+def sc_matmul(a: torch.Tensor, b: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """Device-guarded public entry point. See :func:`_sc_matmul_impl` for the
+    full API (this forwards all arguments unchanged).
+
+    The Triton kernels launch on ``torch.cuda.current_device()`` (cuda:0 by
+    default). Under ``device_map="auto"`` model sharding, a layer's tensors can
+    live on cuda:1 while the kernel still launches in the cuda:0 context, which
+    dereferences cuda:1 pointers from a cuda:0 launch -> ``CUDA error: an
+    illegal memory access was encountered``. Entering ``a``'s device makes every
+    launch (and the per-head/batched stream contexts) target the right GPU. This
+    is a no-op on single-GPU and on CPU inputs.
+    """
+    guard = (torch.cuda.device(a.device)
+             if a.is_cuda else contextlib.nullcontext())
+    with guard:
+        return _sc_matmul_impl(a, b, *args, **kwargs)
+
+
+@torch.no_grad()
+def _sc_matmul_impl(
     a: torch.Tensor,
     b: torch.Tensor,
     granularity: str = "per_row",
@@ -100,7 +146,10 @@ def sc_matmul(
             RNG grid of size ``2 ** (sc_prec - 1)`` are sufficient. When
             ``True`` and ``mode == "bipolar"``, any ``stoc_len`` /
             ``rng_levels`` left at ``None`` are overridden to
-            ``2 ** (sc_prec - 1)`` (≈2× fewer cycles, same magnitude grid).
+            ``2 ** (sc_prec - 1)`` (≈2× fewer cycles, same magnitude grid),
+            and explicit values above ``2 ** (sc_prec - 1)`` raise
+            ``ValueError`` — such streams are unrealizable on halve hardware
+            and would silently inflate simulated accuracy.
             Has no effect when ``mode == "unipolar"``. Default ``False``
             preserves legacy behavior.
         smooth_scales: optional ``(D,)`` SmoothQuant per-channel scaling
@@ -138,6 +187,9 @@ def sc_matmul(
         ValueError: if ``granularity="per_head"`` is requested with a non-3D
             input, or with ``mode != "bipolar"``.
         ValueError: for unknown ``granularity`` or ``mode`` values.
+        ValueError: if ``halve_bipolar_stoc_len=True`` (bipolar) is combined
+            with an explicit ``stoc_len`` or ``rng_levels`` above
+            ``2 ** (sc_prec - 1)``.
     """
     if granularity not in _VALID_GRANULARITIES:
         raise ValueError(
@@ -189,8 +241,32 @@ def sc_matmul(
         halved = 2 ** (sc_prec - 1)
         if stoc_len is None:
             stoc_len = halved
+        elif stoc_len > halved:
+            # Halve hardware's canonical full stream is 2^(sc_prec-1) cycles;
+            # longer streams only re-sample the halved RNG grid — extra joint
+            # (a, b) coverage the hardware cannot realize. Accepting them here
+            # silently inflates simulated accuracy (and any cycle budget built
+            # on top), so reject loudly instead of clamping.
+            raise ValueError(
+                f"sc_matmul: stoc_len={stoc_len} exceeds the halve-mode "
+                f"maximum 2^(sc_prec-1)={halved} (sc_prec={sc_prec}). "
+                f"Streams longer than {halved} are unrealizable with "
+                f"halve_bipolar_stoc_len=True.")
         if rng_levels is None:
             rng_levels = halved
+        elif rng_levels > halved:
+            raise ValueError(
+                f"sc_matmul: rng_levels={rng_levels} exceeds the halve-mode "
+                f"grid 2^(sc_prec-1)={halved} (sc_prec={sc_prec}); the "
+                f"sign-magnitude grid only has {halved} levels.")
+
+    # ---- SmoothQuant pre-transform ------------------------------------------
+    # Migrate per-channel activation outliers into the weight via a
+    # mathematically equivalent diagonal rescaling along D. The downstream
+    # int-quant kernels are unchanged — they just see better-conditioned
+    # operands.
+    if smooth_scales is not None:
+        a, b = apply_smoothing(a, b, smooth_scales)
 
     # ---- SmoothQuant pre-transform ------------------------------------------
     # Migrate per-channel activation outliers into the weight via a

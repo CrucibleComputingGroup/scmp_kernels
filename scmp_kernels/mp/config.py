@@ -9,6 +9,8 @@ Includes:
 - MPConfig: Fixed-fraction quantile-based assignment (original).
 - AdaptiveMPConfig: Timestep-adaptive thresholds with per-operator and
   per-layer control, inspired by HPCA APT's APDT algorithm.
+- FreeBoundaryMPConfig: Zero-hyperparameter per-(block, op) free boundaries
+  (k-1 for k levels), filled in by an offline oracle search.
 """
 from __future__ import annotations
 
@@ -18,6 +20,22 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+
+# ---------------------------------------------------------------------
+# Per-block context: classifiers that index by (block, op) read this
+# global; the auto-calibrator and runtime pre-hooks set it per forward.
+# ---------------------------------------------------------------------
+_CURRENT_BLOCK_IDX: int = 0
+
+
+def set_current_block_idx(i: int) -> None:
+    global _CURRENT_BLOCK_IDX
+    _CURRENT_BLOCK_IDX = int(i)
+
+
+def get_current_block_idx() -> int:
+    return _CURRENT_BLOCK_IDX
 
 
 @dataclass
@@ -179,38 +197,45 @@ def classify_rows_by_metric(
 
 @dataclass
 class AdaptiveMPConfig:
-    """Timestep-adaptive mixed precision with true thresholds and per-operator
-    parameters.
+    """Mixed precision driven by calibrated per-row thresholds.
 
-    Uses absolute thresholds on normalized metric values instead of fixed
-    fractions.  The number of rows per level adapts to the actual data
-    distribution.
+    Rows are classified by one of three data-driven paths (checked in this
+    order by ``adaptive_classify_rows``):
 
-    Threshold: base_threshold(t) = α · progress(t) + β
-    where progress(t) = t / (T-1)  ∈ [0, 1] (high at noisy, low at clean).
+      1. Free-boundary (``FreeBoundaryMPConfig`` subclass): per-(block, op)
+         boundaries populated by the offline auto-MP oracle search.
+      2. Quantile (``target_fractions`` set): top frac[0] rows -> levels[0],
+         etc. — distribution-independent fixed fractions.
+      3. Calibrated table (``threshold_table_path`` set): per-(operator,
+         timestep_bucket, layer_bucket) thresholds from
+         ``calibrate_mp_thresholds.py``.
 
-    Rows with high normalized metric → high stoc_len (precise).
-    Rows with low normalized metric → low stoc_len or pruned.
+    There is no closed-form fallback: a classify call that matches none of the
+    three data-driven paths is a configuration bug and raises.
 
     Args:
         stoc_len_levels: Descending list of stoc_len values.
             Use 0 as the last level to enable pruning (skip).
-        alpha: Global default sensitivity to timestep progress.
-        beta: Global default base threshold offset.
         enable_pruning: Allow stoc_len=0 (skip) level.
-        operator_params: Per-operator (alpha, beta) overrides.
-            Keys: "qk", "av", "mlp_fc1", "mlp_fc2", "input_proj", "proj".
     """
     stoc_len_levels: list[int]
-    alpha: float = 0.3
-    beta: float = 0.05
     enable_pruning: bool = True
-    operator_params: dict[str, tuple[float, float]] = field(default_factory=dict)
     threshold_table_path: Optional[str] = None
     timestep_buckets: int = 1
     layer_buckets: int = 1
     operator_default_thresholds: dict[str, list[float]] = field(default_factory=dict)
     bucket_thresholds: dict[tuple[str, int, int], list[float]] = field(default_factory=dict)
+    # When set, bypass the linear-threshold classifier and use these fractions
+    # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
+    # Length must match stoc_len_levels; sums to 1.
+    target_fractions: Optional[list[float]] = None
+    # Protected (salient) input channels: {(operator, block_idx, unit_idx):
+    # [channel indices]} loaded from the table's "protected_channels" section.
+    # Runtime splits these channels into their own SC stream at
+    # ``protected_channel_stoc_len`` and row-dispatches only the residual
+    # channels (see scmp_llm model/sc_common.py SCLinear MP path).
+    protected_channels: dict = field(default_factory=dict)
+    protected_channel_stoc_len: Optional[int] = None
 
     def __post_init__(self):
         assert len(self.stoc_len_levels) >= 2, (
@@ -223,12 +248,13 @@ class AdaptiveMPConfig:
             self.stoc_len_levels = [s for s in self.stoc_len_levels if s > 0]
         if self.threshold_table_path:
             self.load_threshold_table(self.threshold_table_path)
-
-    def get_params(self, operator: Optional[str] = None) -> tuple[float, float]:
-        """Get (alpha, beta) for an operator, falling back to global."""
-        if operator and operator in self.operator_params:
-            return self.operator_params[operator]
-        return (self.alpha, self.beta)
+        if self.target_fractions is not None:
+            assert len(self.target_fractions) == len(self.stoc_len_levels), (
+                f"target_fractions length {len(self.target_fractions)} "
+                f"must match stoc_len_levels length {len(self.stoc_len_levels)}")
+            s = sum(self.target_fractions)
+            assert abs(s - 1.0) < 1e-6, (
+                f"target_fractions must sum to 1.0, got {s}")
 
     def load_threshold_table(self, path: str):
         """Load calibrated thresholds exported by calibrate_mp_thresholds.py."""
@@ -263,6 +289,51 @@ class AdaptiveMPConfig:
                 bucket_key,
             )
 
+        # Optional protected-channel section (exported by the LLM/CNN
+        # calibrators' --protect-channel-frac path). Keys are "op:b<N>" or
+        # "op:b<N>:u<M>" (unit = MoE expert index; None for dense modules).
+        self.protected_channels = {}
+        self.protected_channel_stoc_len = None
+        protected = payload.get("protected_channels")
+        if protected:
+            self.protected_channel_stoc_len = int(protected.get("stoc_len", 0)) or None
+            for key_str, indices in protected.get("indices", {}).items():
+                parts = key_str.split(":")
+                if len(parts) < 2 or not parts[1].startswith("b"):
+                    raise ValueError(
+                        f"Invalid protected-channel key '{key_str}'. "
+                        "Expected '<operator>:b<int>[:u<int>]'.")
+                operator = parts[0]
+                block_idx = int(parts[1][1:])
+                unit_idx = None
+                if len(parts) > 2:
+                    if not parts[2].startswith("u"):
+                        raise ValueError(
+                            f"Invalid protected-channel key '{key_str}'.")
+                    unit_idx = int(parts[2][1:])
+                self.protected_channels[(operator, block_idx, unit_idx)] = [
+                    int(i) for i in indices]
+
+    def get_protected_channels(
+        self,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        unit_idx: Optional[int] = None,
+    ) -> list[int]:
+        """Protected input-channel indices for one module (empty when none).
+
+        Looks up (operator, block_idx, unit_idx) first, then falls back to the
+        dense (operator, block_idx, None) entry so per-expert overrides
+        coexist with a shared per-layer list.
+        """
+        if not self.protected_channels or operator is None or block_idx is None:
+            return []
+        key = (operator, int(block_idx), unit_idx)
+        vals = self.protected_channels.get(key)
+        if vals is None and unit_idx is not None:
+            vals = self.protected_channels.get((operator, int(block_idx), None))
+        return vals or []
+
     def get_thresholds(
         self,
         timestep: int,
@@ -285,49 +356,75 @@ class AdaptiveMPConfig:
 
 def adaptive_classify_rows(
     metric: torch.Tensor,
-    timestep: int,
-    total_timesteps: int,
     config: AdaptiveMPConfig,
     operator: Optional[str] = None,
     block_idx: Optional[int] = None,
     total_blocks: Optional[int] = None,
+    timestep: int = 0,
+    total_timesteps: int = 1,
 ) -> RowAssignment:
-    """Classify rows using true absolute thresholds on normalized metrics.
+    """Classify rows by one of three data-driven paths (no closed-form mode).
 
-    Unlike quantile-based classification, the number of rows per level
-    adapts to the actual metric distribution.  Per-operator α/β allows
-    different aggressiveness for different operators.
+    Checked in order: free-boundary (``FreeBoundaryMPConfig``), quantile
+    (``target_fractions``), then calibrated table (``threshold_table_path``).
+    Matching none of them is a configuration bug and raises.
 
     Args:
         metric: [N] per-row importance values (e.g. row abs-max).
-        timestep: Current diffusion timestep (T-1 = noisiest, 0 = cleanest).
-        total_timesteps: Total number of diffusion timesteps T.
         config: AdaptiveMPConfig instance.
-        operator: Operator name for per-operator α/β lookup.
+        operator: Operator name for table / boundary lookup (e.g. "q_proj", "qk").
+        block_idx: Layer / block index for table / boundary lookup.
+        total_blocks: Total number of layers / blocks (used for bucketing).
+        timestep: Diffusion timestep for table bucketing. LLM inference: 0.
+        total_timesteps: Total diffusion timesteps for bucketing. LLM: 1.
 
     Returns:
-        RowAssignment compatible with existing code.
+        RowAssignment compatible with existing dispatch code.
     """
     N = metric.shape[0]
     levels = config.stoc_len_levels
     n_levels = len(levels)
 
-    # progress: 1 at noisiest (t=T-1), 0 at cleanest (t=0)
-    # Early (noisy) steps → high progress → high base_threshold → aggressive
-    # Late (clean) steps → low progress → low base_threshold → conservative
-    progress = timestep / max(total_timesteps - 1, 1)
+    # Empty row batch — e.g. a MoE expert that received ZERO tokens this forward
+    # (sparse top-k routing). metric is empty, so .min()/.argsort() below would
+    # crash on the empty reduction. Return an empty assignment; the caller's
+    # per-level dispatch loop then does nothing (empty expert → empty output).
+    if N == 0:
+        empty = torch.empty(0, dtype=torch.long, device=metric.device)
+        return RowAssignment(row_levels=empty,
+                             level_row_indices={sl: empty for sl in levels})
 
-    # Per-operator α/β
-    alpha, beta = config.get_params(operator)
+    # ---------- Free-boundary path (FreeBoundaryMPConfig) ----------
+    # Per-(block, op) learned boundaries; no timestep/progress dependency.
+    # Check subclass first so inherited isinstance(cfg, AdaptiveMPConfig)
+    # dispatch still works elsewhere while we dispatch correctly here.
+    if isinstance(config, FreeBoundaryMPConfig):
+        fixed_level = config.get_fixed_level(operator or "")
+        if fixed_level is not None:
+            return _classify_all_rows_to_level(metric, levels, fixed_level)
+        boundaries = config.get_boundaries(operator or "")
+        return _classify_with_free_boundaries(metric, boundaries, levels)
 
-    # Base threshold: the cutoff on normalized metric [0,1].
-    # Rows with metric_norm >= base_threshold → level 0 (highest precision).
-    # Rows with metric_norm < base_threshold → split among lower levels.
-    # Higher base_threshold = more rows get lower precision.
-    # base_threshold=0.95 (very aggressive) → only top 5% get level 0.
-    base_threshold = alpha * progress + beta
-    base_threshold = min(base_threshold, 0.95)
+    # ---------- Quantile path (target_fractions set) ----------
+    # Independent of (t, T). Top frac[0] rows -> levels[0], etc.
+    if config.target_fractions is not None:
+        sorted_idx = metric.argsort(descending=True)
+        row_levels_q = torch.empty(N, dtype=torch.long, device=metric.device)
+        level_row_indices_q: dict[int, torch.Tensor] = {}
+        offset = 0
+        for i, (sl, frac) in enumerate(zip(levels, config.target_fractions)):
+            if i < n_levels - 1:
+                count = round(frac * N)
+            else:
+                count = N - offset
+            rows_q = sorted_idx[offset:offset + count]
+            row_levels_q[rows_q] = i
+            level_row_indices_q[sl] = rows_q
+            offset += count
+        return RowAssignment(row_levels=row_levels_q,
+                             level_row_indices=level_row_indices_q)
 
+    # ---------- Calibrated-table path (threshold_table_path set) ----------
     # Normalize metric to [0, 1]
     m_min = metric.min()
     m_max = metric.max()
@@ -356,37 +453,230 @@ def adaptive_classify_rows(
     if calibrated_thresholds is not None:
         return _classify_rows_by_thresholds(metric_norm, levels, calibrated_thresholds)
 
-    # Split [0, base_threshold] evenly among non-highest levels.
-    # For 3 levels [256, 64, 0] with base_threshold=0.3:
-    #   metric_norm >= 0.3  → level 0 (sl=256)
-    #   0.15 <= metric_norm < 0.3  → level 1 (sl=64)
-    #   metric_norm < 0.15  → level 2 (sl=0, pruned)
-    #
-    # N-1 boundaries from high to low:
-    #   boundaries[0] = base_threshold  (between level 0 and level 1)
-    #   boundaries[k] = base_threshold * (n_levels - 1 - k) / (n_levels - 1)
-    row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)  # default: level 0
+    # No path matched (not free-boundary, no target_fractions, and no
+    # calibrated thresholds for this operator/bucket). There is no closed-form
+    # fallback — this is a configuration bug.
+    raise ValueError(
+        f"AdaptiveMPConfig: no classification path for operator={operator!r} "
+        f"block_idx={block_idx} (not a FreeBoundaryMPConfig, target_fractions "
+        f"unset, and no calibrated thresholds — bucket miss and no "
+        f"operator_default). Re-run calibration covering this operator/layer, "
+        f"or set target_fractions."
+    )
 
-    boundaries = []
-    for k in range(n_levels - 1):
-        # boundary[0] = base_threshold (highest, between level 0 and 1)
-        # boundary[n-2] = base_threshold / (n-1) (lowest, between level n-2 and n-1)
-        b = base_threshold * (n_levels - 1 - k) / (n_levels - 1)
-        boundaries.append(b)
 
-    # Assign from lowest precision upward:
-    # Everything starts at level 0 (highest precision).
-    # Then demote rows below each boundary.
-    for k in range(n_levels - 1):
-        # Rows with metric_norm < boundaries[k] get demoted to level k+1 or lower
-        row_levels[metric_norm < boundaries[k]] = k + 1
+# =====================================================================
+# Free-boundary MP (zero hyperparameter; offline oracle-search populated)
+# =====================================================================
 
-    # Build level_row_indices
+@dataclass
+class FreeBoundaryMPConfig(AdaptiveMPConfig):
+    """Per-(block, op) k-1 free boundaries on normalized metric in [0, 1].
+
+    Subclasses ``AdaptiveMPConfig`` so existing ``isinstance(cfg,
+    AdaptiveMPConfig)`` dispatch in the SC attention patch continues to
+    fire. The inherited ``target_fractions`` field is ignored when the
+    classifier takes the free-boundary branch.
+
+    Boundaries are keyed by ``(block_idx, op_name)``; block_idx is read
+    from the module-level ``_CURRENT_BLOCK_IDX`` at classification time
+    (set by forward pre-hooks installed by the auto-calibrator).
+
+    Missing entries fall back to ``default_boundaries`` (equal spacing).
+    Callers may also pin an op to a fixed level index via ``fixed_levels``;
+    this is useful when some ops should stay coarse/static while others are
+    searched by auto-MP.
+    """
+    # {(block_idx, op_name): tensor of k-1 boundaries, descending in (0, 1)}
+    boundaries: dict = field(default_factory=dict)
+    # {(block_idx, op_name): level_idx}, where level_idx indexes stoc_len_levels
+    fixed_levels: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        # sanity-check any pre-populated entries
+        k = len(self.stoc_len_levels)
+        for key, b in self.boundaries.items():
+            assert isinstance(key, tuple) and len(key) == 2, (
+                f"boundaries key must be (block_idx, op_name), got {key!r}")
+            bt = b if isinstance(b, torch.Tensor) else torch.as_tensor(b)
+            assert bt.numel() == k - 1, (
+                f"boundaries[{key!r}] must have length {k-1}, got {bt.numel()}")
+        for key, level_idx in self.fixed_levels.items():
+            assert isinstance(key, tuple) and len(key) == 2, (
+                f"fixed_levels key must be (block_idx, op_name), got {key!r}")
+            li = int(level_idx)
+            assert 0 <= li < k, (
+                f"fixed_levels[{key!r}] must be in [0, {k}), got {li}")
+
+    def default_boundaries(self) -> torch.Tensor:
+        """Equal-spacing boundaries in (0, 1) descending, length k-1."""
+        k = len(self.stoc_len_levels)
+        return torch.tensor(
+            [(k - 1 - i) / k for i in range(k - 1)], dtype=torch.float32)
+
+    def get_boundaries(self, operator: str,
+                       block_idx: Optional[int] = None) -> torch.Tensor:
+        if block_idx is None:
+            block_idx = _CURRENT_BLOCK_IDX
+        key = (int(block_idx), operator)
+        if key in self.boundaries:
+            b = self.boundaries[key]
+            return b if isinstance(b, torch.Tensor) else torch.as_tensor(b)
+        return self.default_boundaries()
+
+    def set_boundaries(self, operator: str, block_idx: int,
+                       boundaries: torch.Tensor) -> None:
+        bt = (boundaries.detach().cpu().float() if isinstance(boundaries, torch.Tensor)
+              else torch.as_tensor(boundaries, dtype=torch.float32))
+        k = len(self.stoc_len_levels)
+        assert bt.numel() == k - 1, (
+            f"expected {k-1} boundaries, got {bt.numel()}")
+        self.fixed_levels.pop((int(block_idx), operator), None)
+        self.boundaries[(int(block_idx), operator)] = bt
+
+    def get_fixed_level(self, operator: str,
+                        block_idx: Optional[int] = None) -> Optional[int]:
+        if block_idx is None:
+            block_idx = _CURRENT_BLOCK_IDX
+        level_idx = self.fixed_levels.get((int(block_idx), operator))
+        return None if level_idx is None else int(level_idx)
+
+    def set_fixed_level(self, operator: str, block_idx: int,
+                        level_idx: int) -> None:
+        li = int(level_idx)
+        k = len(self.stoc_len_levels)
+        assert 0 <= li < k, f"level_idx must be in [0, {k}), got {li}"
+        key = (int(block_idx), operator)
+        self.boundaries.pop(key, None)
+        self.fixed_levels[key] = li
+
+    def clear_fixed_level(self, operator: str, block_idx: int) -> None:
+        self.fixed_levels.pop((int(block_idx), operator), None)
+
+
+def _classify_all_rows_to_level(
+    metric: torch.Tensor,
+    stoc_len_levels: list[int],
+    level_idx: int,
+) -> "RowAssignment":
+    """Assign every row/head to one fixed level index."""
+    N = metric.shape[0]
+    row_levels = torch.full(
+        (N,), int(level_idx), dtype=torch.long, device=metric.device)
     level_row_indices: dict[int, torch.Tensor] = {}
-    for i, sl in enumerate(levels):
-        level_row_indices[sl] = torch.where(row_levels == i)[0]
+    for idx, sl in enumerate(stoc_len_levels):
+        if idx == int(level_idx):
+            level_row_indices[sl] = torch.arange(N, device=metric.device)
+        else:
+            level_row_indices[sl] = torch.empty(
+                0, dtype=torch.long, device=metric.device)
+    return RowAssignment(row_levels=row_levels,
+                         level_row_indices=level_row_indices)
 
-    return RowAssignment(row_levels=row_levels, level_row_indices=level_row_indices)
+
+def _classify_with_free_boundaries(
+    metric: torch.Tensor,
+    boundaries: torch.Tensor,
+    stoc_len_levels: list[int],
+) -> "RowAssignment":
+    """Bucket rows by normalized metric against free, non-equal-spaced
+    descending boundaries. See ``adaptive_classify_rows`` for the semantics
+    (level 0 = highest stoc_len, assigned to rows above the first boundary).
+    """
+    N = metric.shape[0]
+    n_levels = len(stoc_len_levels)
+
+    m_min = metric.min()
+    m_max = metric.max()
+    if (m_max - m_min).item() < 1e-8:
+        # Degenerate distribution: default to level 0.
+        row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)
+        level_row_indices: dict[int, torch.Tensor] = {}
+        for idx, sl in enumerate(stoc_len_levels):
+            if idx == 0:
+                level_row_indices[sl] = torch.arange(N, device=metric.device)
+            else:
+                level_row_indices[sl] = torch.empty(
+                    0, dtype=torch.long, device=metric.device)
+        return RowAssignment(row_levels=row_levels,
+                             level_row_indices=level_row_indices)
+
+    metric_norm = (metric - m_min) / (m_max - m_min)
+
+    # Ensure descending order for safety — boundaries may come from a
+    # coord-descent step that hasn't yet re-sorted.
+    b_sorted, _ = torch.sort(boundaries.to(metric.device).float(),
+                             descending=True)
+    row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)
+    for k in range(n_levels - 1):
+        row_levels[metric_norm < b_sorted[k]] = k + 1
+
+    level_row_indices = {}
+    for i, sl in enumerate(stoc_len_levels):
+        level_row_indices[sl] = torch.where(row_levels == i)[0]
+    return RowAssignment(row_levels=row_levels,
+                         level_row_indices=level_row_indices)
+
+
+# =====================================================================
+# Auto-MP budget logger (compute savings tracking during oracle search)
+# =====================================================================
+
+class AutoMPBudgetLogger:
+    """Lightweight per-forward compute logger for budget-aware auto-MP.
+
+    SC operators record a baseline cost (all rows/heads at max stoc_len) and
+    the actual weighted stoc_len cost induced by the current assignment. The
+    auto-MP calibrator enables this logger only while scoring candidate
+    boundaries, so it sees the true block-local compute for that candidate.
+    """
+
+    _enabled: bool = False
+    _log: list[dict] = []
+
+    @classmethod
+    def enable(cls):
+        cls._enabled = True
+
+    @classmethod
+    def disable(cls):
+        cls._enabled = False
+
+    @classmethod
+    def clear(cls):
+        cls._log.clear()
+
+    @classmethod
+    def record(cls, block_idx: int, operator: str,
+               baseline: float, actual: float):
+        if not cls._enabled:
+            return
+        cls._log.append({
+            "block": int(block_idx),
+            "operator": operator,
+            "baseline": float(baseline),
+            "actual": float(actual),
+        })
+
+    @classmethod
+    def snapshot(cls, clear: bool = False) -> list[dict]:
+        out = list(cls._log)
+        if clear:
+            cls.clear()
+        return out
+
+    @classmethod
+    def totals(cls, clear: bool = False) -> dict[str, float]:
+        total_baseline = 0.0
+        total_actual = 0.0
+        for entry in cls._log:
+            total_baseline += entry["baseline"]
+            total_actual += entry["actual"]
+        out = {"baseline": total_baseline, "actual": total_actual}
+        if clear:
+            cls.clear()
+        return out
 
 
 # =====================================================================

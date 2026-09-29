@@ -615,23 +615,37 @@ def _resolve_rng_levels(sc_prec: int, rng_levels: Optional[int]) -> int:
 # without sacrificing low-discrepancy inside each stratum.
 #
 # Mask source is selected via env var SC_OWEN_MODE:
-#   - "counter" (default): m[d] = d mod base_levels. Round-robin "clock"
-#     mask. Strictly equipartitioned across all 2-power moduli (mod 2, 4,
-#     8, ...), so a single mask works correctly for every stoc_len value
-#     and every per-row mixed-precision schedule with no recalibration.
-#     Hardware-friendly: implementable as a wire tap on the row counter,
-#     no ROM needed.
-#   - "bitrev": m[d] = bit_reverse(d mod base_levels). Same equipartition
-#     property as "counter" but breaks "low bits run consecutively" so
-#     adjacent-D correlations don't resonate with the mask period.
+#   - "bitrev" (default): m[d] = bit_reverse(d mod M) where
+#     M = min(SC_SCRAMBLE_MASKS, base_levels), SC_SCRAMBLE_MASKS default 64.
+#     Equipartitioned across all 2-power moduli, and the bit reversal breaks
+#     "low bits run consecutively" so adjacent-D correlations don't resonate
+#     with the mask period. M controls the number of DISTINCT masks (a
+#     log2(M)-bit pattern in hardware); M < base_levels scrambles only the
+#     low log2(M) bits of each dimension's trajectory.
+#     NOTE: results are only comparable across runs with the SAME M — tables
+#     produced before this knob existed (e.g. _mp_overnight_xlayer_fix) ran
+#     at M = base_levels = 256; reproduce them with SC_SCRAMBLE_MASKS=256.
 #   - "random": legacy behavior. m[d] ~ Uniform[0, base_levels) drawn from
 #     a fixed seed (deterministic but with sampling fluctuations).
-#   - "off": disable scrambling (same as SC_DISABLE_OWEN=1; biased path).
+#   - "off": disable scrambling (biased path; ablation only).
+#
+# Removed knobs (fail loudly rather than silently flip behavior):
+#   - SC_OWEN_MODE=counter — removed; bitrev keeps its equipartition property.
+#   - SC_DISABLE_OWEN=1    — removed; use SC_OWEN_MODE=off.
+#   - SC_SCRAMBLE_RESCALE  — removed; scramble-before-rescale is always on
+#     (the =0 legacy path shared one Sobol trajectory across all dims, so SC
+#     error accumulated across D instead of averaging — catastrophic at short
+#     stoc_len; it survived only as an ablation and is now retired).
 #
 # Cached enable tables are keyed by (config, sc_prec, stoc_len, rng_levels)
-# but NOT by the scramble mode/seed; switching modes mid-process requires
-# clear_rng_cache().
+# PLUS a scramble tag (_scramble_cache_tag): resolved mode + mask count for
+# entries whose build actually scrambles (truncated prefix or rescaled grid),
+# and a shared "none" tag for full-length/full-grid entries that never
+# scramble. Switching SC_OWEN_MODE / SC_SCRAMBLE_MASKS mid-process therefore
+# just misses the cache and rebuilds — clear_rng_cache() is no longer needed
+# for correctness (it remains useful to free GPU memory).
 _OWEN_SCRAMBLE_SEED = 0x5A5A5A5A
+_DEFAULT_SCRAMBLE_MASKS = 64
 
 
 def _bit_reverse(x: torch.Tensor, n_bits: int) -> torch.Tensor:
@@ -642,29 +656,76 @@ def _bit_reverse(x: torch.Tensor, n_bits: int) -> torch.Tensor:
     return y
 
 
+# Hardware realizes at most this many DISTINCT scramble patterns (a log2(M)-bit
+# mask selector). This is the BINDING cap — M cannot exceed it in silicon, so
+# requesting more (e.g. SC_SCRAMBLE_MASKS=256) is a simulation-only "ideal" and
+# is clamped here rather than silently pretending the hardware could do it.
+HW_MAX_MASKS = 64
+
+
+def _scramble_mask_count(base_levels: int) -> int:
+    """Resolve M = min(SC_SCRAMBLE_MASKS, HW_MAX_MASKS, base_levels).
+
+    SC_SCRAMBLE_MASKS defaults to 64. Capped at HW_MAX_MASKS (hardware pattern
+    limit; the binding constraint) and at base_levels (there are only that many
+    distinct scramble values, so >base_levels would alias under the fixed-width
+    bit reversal). Must be a power of two so bit reversal is a bijection on
+    [0, M). Note: the mask WIDTH is log2(base_levels) regardless of M — a small
+    M reuses fewer distinct patterns but each still scrambles the full width."""
+    raw = os.environ.get("SC_SCRAMBLE_MASKS", "").strip()
+    k = int(raw) if raw else _DEFAULT_SCRAMBLE_MASKS
+    if k <= 0:
+        raise ValueError(
+            f"SC_SCRAMBLE_MASKS must be a positive power of two, got {k}.")
+    m = min(k, HW_MAX_MASKS, base_levels)
+    if m & (m - 1):
+        raise ValueError(
+            f"SC_SCRAMBLE_MASKS must be a power of two, got {k} "
+            f"(effective M={m} after min with HW_MAX_MASKS={HW_MAX_MASKS}, "
+            f"base_levels={base_levels}).")
+    return m
+
+
 def _owen_scramble(prefix: torch.Tensor, base_levels: int) -> torch.Tensor:
     """Deterministic per-dimension XOR mask on ``prefix``."""
-    if os.environ.get("SC_DISABLE_OWEN", "0") == "1":
-        return prefix.contiguous()
+    if os.environ.get("SC_DISABLE_OWEN") == "1":
+        raise RuntimeError(
+            "SC_DISABLE_OWEN was removed; use SC_OWEN_MODE=off instead.")
 
-    mode = os.environ.get("SC_OWEN_MODE", "counter").lower()
+    mode = os.environ.get("SC_OWEN_MODE", "bitrev").lower()
     if mode == "off":
         return prefix.contiguous()
 
     D = prefix.shape[0]
 
-    if mode == "counter":
-        idx = torch.arange(D, device=prefix.device, dtype=torch.int64) % base_levels
-        masks = idx.to(prefix.dtype).unsqueeze(1)
-    elif mode == "bitrev":
+    if mode == "bitrev":
+        m = _scramble_mask_count(base_levels)
+        # M distinct masks (the per-dim pattern is period-m in d, i.e. only M
+        # different scrambles — the intended hardware knob), but each mask is a
+        # FULL-WIDTH scramble: bit-reverse over log2(base_levels) bits, NOT
+        # log2(m). Reversing over log2(m) left the top log2(base_levels/m) bits
+        # — the coarsest, largest-magnitude strata — UNSCRAMBLED (M=64, prec=8 =>
+        # only the low 6 of 8 bits moved), which reintroduces the systematic
+        # Sobol-prefix bias on the high strata and craters quality (4B int7 MP
+        # ~15 -> ~30). With full-width reversal, d mod M still yields exactly M
+        # distinct masks, but they spread across the high (coarse) bits where
+        # decorrelation matters.
         n_bits = int(round(math.log2(base_levels)))
-        idx = torch.arange(D, device=prefix.device, dtype=torch.int64) % base_levels
+        idx = torch.arange(D, device=prefix.device, dtype=torch.int64) % m
         masks = _bit_reverse(idx, n_bits).to(prefix.dtype).unsqueeze(1)
-    else:  # "random" — legacy fixed-seed PRNG
+    elif mode == "random":  # legacy fixed-seed PRNG
         g = torch.Generator(device=prefix.device).manual_seed(_OWEN_SCRAMBLE_SEED)
         masks = torch.randint(
             0, base_levels, (D, 1), generator=g, device=prefix.device
         ).to(prefix.dtype)
+    elif mode == "counter":
+        raise ValueError(
+            "SC_OWEN_MODE=counter was removed; use bitrev (default), "
+            "random, or off.")
+    else:
+        raise ValueError(
+            f"Unknown SC_OWEN_MODE={mode!r}; valid: bitrev (default), "
+            f"random, off.")
 
     return (prefix ^ masks).contiguous()
 
@@ -688,6 +749,20 @@ def _prepare_rng_prefix(
             return _owen_scramble(prefix, base_levels)
         return prefix
 
+    # Always ON: decorrelate the per-dim trajectory BEFORE rescaling onto the
+    # coarser grid. Without it the rescale path (e.g. halve_bipolar_stoc_len,
+    # which forces grid_levels=2^(sc_prec-1)) never scrambles, so every dim
+    # shares one Sobol joint trajectory and SC error accumulates across D
+    # instead of averaging — catastrophic at short stoc_len. XOR is a
+    # bijection on [0, base_levels), so marginals (and the rescaled grid) are
+    # unchanged. SC_OWEN_MODE selects the family (use "off" for the fully
+    # unscrambled ablation). The SC_SCRAMBLE_RESCALE gate was removed; =0 was
+    # the known-bad legacy path and setting it now fails loudly.
+    if os.environ.get("SC_SCRAMBLE_RESCALE") == "0":
+        raise RuntimeError(
+            "SC_SCRAMBLE_RESCALE was removed; scramble-before-rescale is "
+            "always on (use SC_OWEN_MODE=off for the unscrambled ablation).")
+    prefix = _owen_scramble(prefix, base_levels)
     prefix_i64 = prefix.to(torch.int64)
     scaled = torch.div(prefix_i64 * grid_levels, base_levels, rounding_mode="floor")
     return scaled.to(prefix.dtype).contiguous()
@@ -696,6 +771,32 @@ def _prepare_rng_prefix(
 def _enable_table_cache_key(config: dict, sc_prec: int, device: torch.device) -> str:
     """Cache key for enable tables (same as RNG cache key)."""
     return json.dumps(config, sort_keys=True) + f"|{sc_prec}|{device}|enable"
+
+
+def _scramble_cache_tag(sc_prec: int, stoc_len: int, grid_levels: int) -> str:
+    """Cache-key tag for the scramble parameters baked into enable tables.
+
+    Tables are built from ``_prepare_rng_prefix`` output, which applies the
+    Owen scramble whenever the sequence is truncated (``stoc_len <
+    2**sc_prec``) or rescaled onto a different grid (``grid_levels !=
+    2**sc_prec``). The scramble family / mask count come from env vars
+    (SC_OWEN_MODE / SC_SCRAMBLE_MASKS), so they must be part of the cache
+    key — otherwise switching them mid-process silently reuses stale tables.
+    Full-length, full-grid tables never scramble and share the ``none`` tag
+    across modes (no spurious rebuild on a mode switch).
+    """
+    base_levels = 2 ** sc_prec
+    if stoc_len >= base_levels and grid_levels == base_levels:
+        return "|scr=none"
+    mode = os.environ.get("SC_OWEN_MODE", "bitrev").lower()
+    if mode == "off":
+        return "|scr=off"
+    if mode == "random":
+        return f"|scr=random:{_OWEN_SCRAMBLE_SEED:#x}"
+    # bitrev (default): masks depend on M and the full grid width (sc_prec is
+    # already in the base key). Unknown modes still get a tag here — the
+    # build itself raises in _owen_scramble.
+    return f"|scr={mode}:m{_scramble_mask_count(base_levels)}"
 
 
 def build_enable_tables(
@@ -758,7 +859,9 @@ def _get_cached_enable_tables(
     if stoc_len is None:
         stoc_len = 2 ** sc_prec
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
-    key = _enable_table_cache_key(config, sc_prec, device) + f"|sl={stoc_len}|rng={grid_levels}"
+    key = (_enable_table_cache_key(config, sc_prec, device)
+           + f"|sl={stoc_len}|rng={grid_levels}"
+           + _scramble_cache_tag(sc_prec, stoc_len, grid_levels))
     if key not in _enable_table_cache:
         _enable_table_cache[key] = build_enable_tables(
             rng_a, rng_b, sc_prec, stoc_len, rng_levels=grid_levels
@@ -776,7 +879,9 @@ def _get_cached_k_table(
     if stoc_len is None:
         stoc_len = 2 ** sc_prec
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
-    key = _enable_table_cache_key(config, sc_prec, device) + f"|k_only|sl={stoc_len}|rng={grid_levels}"
+    key = (_enable_table_cache_key(config, sc_prec, device)
+           + f"|k_only|sl={stoc_len}|rng={grid_levels}"
+           + _scramble_cache_tag(sc_prec, stoc_len, grid_levels))
     if key not in _k_table_cache:
         _k_table_cache[key] = build_k_table_only(
             rng_a, sc_prec, stoc_len, rng_levels=grid_levels
