@@ -38,13 +38,12 @@ def _halves():
     return [0] * (N_CHUNKS // 2) + [1] * (N_CHUNKS - N_CHUNKS // 2)
 
 
-def _write(k_bands, buckets=None, **table_extra):
+def _write(k_bands, buckets=None):
     payload = {
         "stoc_len_levels": list(GLOBAL),
         "buckets": buckets if buckets is not None else {
             f"down_proj:t0:l{i}": _bucket([0.7, 0.5, 0.3]) for i in range(4)},
     }
-    payload.update(table_extra)
     if k_bands is not None:
         payload["k_bands"] = k_bands
     path = Path(tempfile.mkdtemp()) / "table.json"
@@ -52,10 +51,10 @@ def _write(k_bands, buckets=None, **table_extra):
     return str(path)
 
 
-def _cfg(k_bands, buckets=None, **table_extra):
+def _cfg(k_bands, buckets=None):
     return AdaptiveMPConfig(
         stoc_len_levels=list(GLOBAL),
-        threshold_table_path=_write(k_bands, buckets, **table_extra),
+        threshold_table_path=_write(k_bands, buckets),
         timestep_buckets=1,
         layer_buckets=4,
     )
@@ -282,23 +281,8 @@ class MalformedSpecIsRejectedTest(unittest.TestCase):
         # worse -- so a band that "won" by overrunning the cap would read as a
         # Phase-3 gain. The allocator's search grid is clamped too; this is the
         # backstop for a hand-written or mis-solved table.
-        # The cap follows the table's own halve declaration (the calibrators
-        # always write sc_prec / halve_bipolar_stoc_len into the table).
         with self.assertRaisesRegex(ValueError, "exceeds the stream-length cap"):
-            _cfg(_spec([[136, 64, 48, 32], [56, 64, 48, 32]]),
-                 sc_prec=8, halve_bipolar_stoc_len=True)
-
-    def test_silent_table_gets_the_full_grid_cap(self):
-        # No halve declaration -> cap is 2**sc_prec; the sc_matmul halve guard
-        # is the runtime backstop. 136 <= 256 loads; 300 does not. (Band 0 is
-        # 36 chunks = 4608 cols, band 1 is 35 chunks + 56 = 4536 cols, so the
-        # wide rung goes on the NARROWER band: MAC-weighted mean 95.69 vs the
-        # parent 96 is a 0.31-cycle underspend, inside K_BAND_MAX_UNDERSPEND;
-        # the other way round it would overspend by 0.31 > K_BAND_ISO_COST_TOL.)
-        _cfg(_spec([[56, 64, 48, 32], [136, 64, 48, 32]]))
-        with self.assertRaisesRegex(ValueError, "exceeds the stream-length cap"):
-            _cfg(_spec([[300, 64, 48, 32], [56, 64, 48, 32]]),
-                 sc_prec=8, halve_bipolar_stoc_len=False)
+            _cfg(_spec([[136, 64, 48, 32], [56, 64, 48, 32]]))
 
     def test_non_positive_rung_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "non-positive rung"):
