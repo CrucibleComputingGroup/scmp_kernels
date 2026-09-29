@@ -6,6 +6,8 @@ Re-exports the public API from `scmp_kernels.mp.config`.
 from .config import (
     MPConfig,
     AdaptiveMPConfig,
+    compute_row_metric,
+    ROW_METRIC_NAMES,
     FreeBoundaryMPConfig,
     RangeMPConfig,
     RowAssignment,
@@ -28,6 +30,8 @@ from .auto_calibrator import (
 __all__ = [
     "MPConfig",
     "AdaptiveMPConfig",
+    "compute_row_metric",
+    "ROW_METRIC_NAMES",
     "FreeBoundaryMPConfig",
     "RangeMPConfig",
     "RowAssignment",

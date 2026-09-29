@@ -91,6 +91,87 @@ def _parse_bucket_key(bucket_key: str) -> tuple[str, int, int]:
         ) from exc
 
 
+def _parse_protected_channel_key(key: str) -> tuple[str, int, Optional[int]]:
+    """Parse protected-channel keys like 'q_proj:b12' or 'up_proj:b3:u7'."""
+    try:
+        parts = key.split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError
+        operator, b_part = parts[0], parts[1]
+        if not b_part.startswith("b"):
+            raise ValueError
+        unit = None
+        if len(parts) == 3:
+            u_part = parts[2]
+            if not u_part.startswith("u"):
+                raise ValueError
+            unit = int(u_part[1:])
+        return operator, int(b_part[1:]), unit
+    except Exception as exc:  # pragma: no cover - defensive parsing
+        raise ValueError(
+            f"Invalid protected-channel key '{key}'. "
+            "Expected '<operator>:b<int>' or '<operator>:b<int>:u<int>'."
+        ) from exc
+
+
+def _extract_group_levels(payload, source: str) -> Optional[list[int]]:
+    """Extract a per-group ladder from a bucket payload, or None if absent.
+
+    Returning None (not the global list) is what keeps a table without
+    per-group ladders on the byte-identical path.
+
+    STRICTLY descending is required, not merely non-increasing: RowAssignment
+    keys level_row_indices by the stoc_len VALUE, so two rungs sharing a value
+    would silently collapse into one entry and the rows of the lower rung
+    would be evaluated at the higher rung's length with no error anywhere.
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("stoc_len_levels")
+    if raw is None:
+        return None
+    levels = [int(x) for x in raw]
+    if len(levels) < 2:
+        raise ValueError(
+            f"Per-group stoc_len_levels for {source} must have >= 2 rungs, "
+            f"got {levels}.")
+    for idx in range(1, len(levels)):
+        if levels[idx] >= levels[idx - 1]:
+            raise ValueError(
+                f"Per-group stoc_len_levels for {source} must be strictly "
+                f"descending (duplicate or ascending rungs silently merge in "
+                f"level_row_indices), got {levels}.")
+    if levels[-1] < 0:
+        raise ValueError(
+            f"Per-group stoc_len_levels for {source} has a negative rung: "
+            f"{levels}.")
+    return levels
+
+
+def residual_chunk_widths(residual_width: int, chunk_d: int) -> list[int]:
+    """Widths of the residual's quantization chunks, tail last.
+
+    Mirrors the kernel's chunk loop (`for d_start in range(0, D, chunk_d)`,
+    sc/kernels.py) so calibration and runtime agree on what a "group" is. The
+    last chunk is short whenever chunk_d does not divide the residual width,
+    which is the common case once protected channels are carved out (e.g.
+    down_proj 9728 - 584 = 9144 -> 71 x 128 + 56).
+    """
+    if residual_width <= 0 or chunk_d <= 0:
+        return []
+    full, tail = divmod(residual_width, chunk_d)
+    return [chunk_d] * full + ([tail] if tail else [])
+
+
+def _band_widths(band_of_chunk: list[int], chunk_widths: list[int],
+                 n_bands: int) -> list[int]:
+    """Total columns per band. Bands need not be contiguous in chunk index."""
+    widths = [0] * n_bands
+    for chunk_idx, band in enumerate(band_of_chunk):
+        widths[band] += chunk_widths[chunk_idx]
+    return widths
+
+
 def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
     """Extract a threshold list of length n_levels-1 from a table payload."""
     raw_thresholds = payload.get("thresholds") if isinstance(payload, dict) else payload
@@ -114,6 +195,35 @@ def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
                 f"got {thresholds}."
             )
     return thresholds
+
+
+_ROW_METRIC_EPS = 1e-12
+# Candidate per-row dispatch metrics (act_global_v2 ρ-selection). All are O(D)
+# reductions over the last dim — same runtime cost class as the original amax.
+ROW_METRIC_NAMES = ("amax", "l2", "crest")
+
+
+def compute_row_metric(x: torch.Tensor, name: str) -> torch.Tensor:
+    """Per-row dispatch metric over the LAST dim of ``x``.
+
+    ``amax``  = ‖row‖_inf (the original metric),
+    ``l2``    = ‖row‖_2,
+    ``crest`` = ‖row‖_inf / ‖row‖_2 (scale-free peakedness).
+
+    The caller multiplies by the calibrated sign (−1 inverts the ranking; the
+    min–max normalization inside ``adaptive_classify_rows`` maps sign-flipped
+    values to exactly ``1 − normalized(raw)``, matching the calibration-side
+    transform in calibrate_mp_thresholds.py).
+    """
+    if name == "amax":
+        return x.abs().amax(dim=-1)
+    if name == "l2":
+        return x.float().norm(dim=-1)
+    if name == "crest":
+        xf = x.float()
+        return xf.abs().amax(dim=-1) / (xf.norm(dim=-1) + _ROW_METRIC_EPS)
+    raise ValueError(f"unknown dispatch metric '{name}' "
+                     f"(expected one of {ROW_METRIC_NAMES})")
 
 
 def _classify_rows_by_thresholds(
@@ -225,17 +335,61 @@ class AdaptiveMPConfig:
     layer_buckets: int = 1
     operator_default_thresholds: dict[str, list[float]] = field(default_factory=dict)
     bucket_thresholds: dict[tuple[str, int, int], list[float]] = field(default_factory=dict)
+    # Per-(op, timestep-bucket, layer-bucket) LADDER, parallel to
+    # bucket_thresholds.  Empty => every bucket uses stoc_len_levels, which is
+    # the historical behaviour.  See get_levels().
+    bucket_stoc_len_levels: dict[tuple[str, int, int], list[int]] = field(
+        default_factory=dict)
+    operator_default_stoc_len_levels: dict[str, list[int]] = field(
+        default_factory=dict)
+    protected_channel_stoc_len: Optional[int] = None
+    protected_channel_indices: dict[tuple[str, int, Optional[int]], list[int]] = field(default_factory=dict)
+    # ---- K-bands (Phase 3: per-group stream lengths) ----------------------
+    # The residual (non-protected) contraction axis is partitioned into
+    # ``k_band_count`` bands of WHOLE quantization chunks. Row dispatch is
+    # unchanged -- one metric, one rung index k per row -- but band b executes
+    # rung k at its own length ``k_band_ladders[(op,t,l)][b][k]``. Setting
+    # every band's ladder equal to the bucket ladder reproduces the per-row
+    # parent exactly, which is what makes this refinement unable to lose.
+    # k_band_count == 0 (default) disables the whole path.
+    k_band_count: int = 0
+    k_band_chunk_d: int = 128
+    # (operator, block_idx) -> band id per residual chunk, ascending chunk order
+    k_band_chunks: dict[tuple[str, int], list[int]] = field(default_factory=dict)
+    # (operator, t_bucket, l_bucket) -> [n_bands][n_rungs] stream lengths
+    k_band_ladders: dict[tuple[str, int, int], list[list[int]]] = field(
+        default_factory=dict)
+    # operator -> residual width R (constant per op: |protected| is per-op
+    # constant even though WHICH channels are protected varies per block)
+    k_band_residual_width: dict[str, int] = field(default_factory=dict)
+    # act_global_v2 ρ-selected dispatch metric: operator -> (name, sign).
+    # Absent operator => ("amax", +1.0), byte-identical to the original
+    # dispatch. Populated from the table's "dispatch_metrics" payload.
+    dispatch_metrics: dict[str, tuple[str, float]] = field(default_factory=dict)
     # When set, bypass the linear-threshold classifier and use these fractions
     # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
     # Length must match stoc_len_levels; sums to 1.
     target_fractions: Optional[list[float]] = None
-    # Protected (salient) input channels: {(operator, block_idx, unit_idx):
-    # [channel indices]} loaded from the table's "protected_channels" section.
-    # Runtime splits these channels into their own SC stream at
-    # ``protected_channel_stoc_len`` and row-dispatches only the residual
-    # channels (see scmp_llm model/sc_common.py SCLinear MP path).
-    protected_channels: dict = field(default_factory=dict)
-    protected_channel_stoc_len: Optional[int] = None
+    # ---- Absolute escape gate (R7) ----------------------------------------
+    # When ``escape_gate_k`` is set, calibrated-table classification adds one
+    # extra compare after the per-call min–max normalization: rows whose
+    # NORMALIZED metric exceeds t_esc_b = metric_mean_b + k * metric_std_b
+    # escape to ``escape_stoc_len``, regardless of the band thresholds.
+    # mu_b / sigma_b are the per-bucket ``metric_mean`` / ``metric_std``
+    # already stored in the calibration table — statistics of the pooled
+    # per-call-normalized SIGNED dispatch metric, i.e. the SAME post-sign
+    # normalized space the band thresholds live in (sign −1 metrics were
+    # stored as 1 − normalized(raw)), so the compare direction never flips.
+    # ``escape_gate_k=None`` (default) disables the gate and is byte-identical
+    # to the pre-gate classifier.
+    escape_gate_k: Optional[float] = None
+    escape_stoc_len: int = 128
+    # Precomputed at table load (one float per bucket / operator default).
+    # NOT clamped to <= 1.0 on purpose: the normalized metric lives in [0, 1]
+    # (max EXACTLY 1.0) and the compare is strict, so a t_esc >= 1.0 simply
+    # never fires for that bucket.
+    bucket_escape_thresholds: dict[tuple[str, int, int], float] = field(default_factory=dict)
+    operator_default_escape_thresholds: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
         assert len(self.stoc_len_levels) >= 2, (
@@ -246,6 +400,18 @@ class AdaptiveMPConfig:
                 f"got {self.stoc_len_levels}")
         if not self.enable_pruning and 0 in self.stoc_len_levels:
             self.stoc_len_levels = [s for s in self.stoc_len_levels if s > 0]
+        if self.escape_gate_k is not None:
+            self.escape_gate_k = float(self.escape_gate_k)
+            self.escape_stoc_len = int(self.escape_stoc_len)
+            if self.escape_stoc_len <= 0:
+                raise ValueError(
+                    f"escape_stoc_len must be a positive cycle count, "
+                    f"got {self.escape_stoc_len}")
+            if not self.threshold_table_path:
+                raise ValueError(
+                    "escape_gate_k requires a calibrated threshold table "
+                    "(threshold_table_path): the gate constants are the "
+                    "table's per-bucket metric_mean/metric_std.")
         if self.threshold_table_path:
             self.load_threshold_table(self.threshold_table_path)
         if self.target_fractions is not None:
@@ -273,66 +439,84 @@ class AdaptiveMPConfig:
         self.layer_buckets = int(payload.get("layer_buckets", 1))
         self.operator_default_thresholds = {}
         self.bucket_thresholds = {}
+        self.operator_default_escape_thresholds = {}
+        self.bucket_escape_thresholds = {}
+        self.bucket_stoc_len_levels = {}
+        self.operator_default_stoc_len_levels = {}
+        self.protected_channel_stoc_len = None
+        self.protected_channel_indices = {}
+        self.k_band_count = 0
+        self.k_band_chunks = {}
+        self.k_band_ladders = {}
+        self.k_band_residual_width = {}
 
         for operator, operator_payload in payload.get("operator_defaults", {}).items():
+            op_levels = _extract_group_levels(
+                operator_payload, f"operator_default:{operator}")
+            if op_levels is not None:
+                self.operator_default_stoc_len_levels[operator] = op_levels
             self.operator_default_thresholds[operator] = _extract_thresholds(
                 operator_payload,
-                len(self.stoc_len_levels),
+                len(op_levels if op_levels is not None
+                    else self.stoc_len_levels),
                 f"operator_default:{operator}",
             )
+            t_esc = self._escape_threshold_from_payload(operator_payload)
+            if t_esc is not None:
+                self.operator_default_escape_thresholds[operator] = t_esc
 
         for bucket_key, bucket_payload in payload.get("buckets", {}).items():
             operator, t_bucket, l_bucket = _parse_bucket_key(bucket_key)
+            # Per-group ladder, if this table declares one.  Thresholds are
+            # then validated against THIS bucket's rung count, not the global
+            # one -- a per-group ladder may legitimately have a different
+            # number of rungs from the table-level default.
+            grp_levels = _extract_group_levels(bucket_payload, bucket_key)
+            if grp_levels is not None:
+                self.bucket_stoc_len_levels[
+                    (operator, t_bucket, l_bucket)] = grp_levels
             self.bucket_thresholds[(operator, t_bucket, l_bucket)] = _extract_thresholds(
                 bucket_payload,
-                len(self.stoc_len_levels),
+                len(grp_levels if grp_levels is not None
+                    else self.stoc_len_levels),
                 bucket_key,
             )
+            t_esc = self._escape_threshold_from_payload(bucket_payload)
+            if t_esc is not None:
+                self.bucket_escape_thresholds[(operator, t_bucket, l_bucket)] = t_esc
 
-        # Optional protected-channel section (exported by the LLM/CNN
-        # calibrators' --protect-channel-frac path). Keys are "op:b<N>" or
-        # "op:b<N>:u<M>" (unit = MoE expert index; None for dense modules).
-        self.protected_channels = {}
-        self.protected_channel_stoc_len = None
-        protected = payload.get("protected_channels")
-        if protected:
-            self.protected_channel_stoc_len = int(protected.get("stoc_len", 0)) or None
-            for key_str, indices in protected.get("indices", {}).items():
-                parts = key_str.split(":")
-                if len(parts) < 2 or not parts[1].startswith("b"):
-                    raise ValueError(
-                        f"Invalid protected-channel key '{key_str}'. "
-                        "Expected '<operator>:b<int>[:u<int>]'.")
-                operator = parts[0]
-                block_idx = int(parts[1][1:])
-                unit_idx = None
-                if len(parts) > 2:
-                    if not parts[2].startswith("u"):
-                        raise ValueError(
-                            f"Invalid protected-channel key '{key_str}'.")
-                    unit_idx = int(parts[2][1:])
-                self.protected_channels[(operator, block_idx, unit_idx)] = [
-                    int(i) for i in indices]
+        if self.escape_gate_k is not None and not (
+                self.bucket_escape_thresholds
+                or self.operator_default_escape_thresholds):
+            raise ValueError(
+                f"escape_gate_k={self.escape_gate_k} is set but the threshold "
+                f"table {path} carries no metric_mean/metric_std in any bucket "
+                "or operator default — the gate constants cannot be derived. "
+                "Recalibrate with a calibrator that exports metric stats, or "
+                "unset escape_gate_k.")
 
-    def get_protected_channels(
-        self,
-        operator: Optional[str] = None,
-        block_idx: Optional[int] = None,
-        unit_idx: Optional[int] = None,
-    ) -> list[int]:
-        """Protected input-channel indices for one module (empty when none).
+        self._load_k_bands(
+            payload.get("k_bands"),
+            sc_prec=int(payload.get("sc_prec", 8)),
+            halve=bool(payload.get("halve_bipolar_stoc_len", True)))
 
-        Looks up (operator, block_idx, unit_idx) first, then falls back to the
-        dense (operator, block_idx, None) entry so per-expert overrides
-        coexist with a shared per-layer list.
-        """
-        if not self.protected_channels or operator is None or block_idx is None:
-            return []
-        key = (operator, int(block_idx), unit_idx)
-        vals = self.protected_channels.get(key)
-        if vals is None and unit_idx is not None:
-            vals = self.protected_channels.get((operator, int(block_idx), None))
-        return vals or []
+        protected = payload.get("protected_channels") or {}
+        indices = protected.get("indices") or {}
+        if indices:
+            self.protected_channel_stoc_len = int(protected.get("stoc_len", 128))
+            for key, vals in indices.items():
+                self.protected_channel_indices[_parse_protected_channel_key(key)] = [
+                    int(v) for v in vals
+                ]
+
+        self.dispatch_metrics = {}
+        for op, spec in (payload.get("dispatch_metrics") or {}).items():
+            name = str(spec.get("metric", "amax"))
+            if name not in ROW_METRIC_NAMES:
+                raise ValueError(
+                    f"Adaptive MP table dispatch_metrics[{op}] names unknown "
+                    f"metric '{name}' (expected one of {ROW_METRIC_NAMES}).")
+            self.dispatch_metrics[op] = (name, float(spec.get("sign", 1.0)))
 
     def get_thresholds(
         self,
@@ -352,6 +536,353 @@ class AdaptiveMPConfig:
         if operator and operator in self.operator_default_thresholds:
             return self.operator_default_thresholds[operator]
         return None
+
+    # ---- K-bands ---------------------------------------------------------
+    # Tolerance on the per-rung iso-cost identity, in halved cycles, MAC
+    # weighted. Band ladders are integers so exact equality is generally
+    # unreachable; 0.25 is well inside the smallest effect worth chasing (a
+    # t48 budget moves ~1 cycle for a 2% change) and far tighter than the
+    # realized-trace band check used downstream.
+    K_BAND_ISO_COST_TOL = 0.25
+    # Underspend is SAFE for the iso-compute claim (a win at lower cost is
+    # strictly stronger), so it gets a looser bound than overspend -- but it is
+    # still bounded, because a solver leaving many cycles unspent is a solver
+    # bug, not a conservative choice.
+    K_BAND_MAX_UNDERSPEND = 2.0
+
+    def _load_k_bands(self, section, sc_prec: int = 8,
+                      halve: bool = True) -> None:
+        """Parse and VALIDATE the k_bands section (Phase 3).
+
+        Everything here is a hard failure rather than a fallback: a malformed
+        band spec that silently degrades to per-row would produce a cell that
+        looks like a Phase-3 result but is not one, and realized_flop_avg_sl
+        would not reveal it.
+        """
+        if not section:
+            return
+        n_bands = int(section.get("n_bands", 0))
+        if n_bands < 2:
+            raise ValueError(
+                f"k_bands.n_bands must be >= 2 (got {n_bands}); omit the "
+                f"section entirely to run the per-row parent.")
+        chunk_d = int(section.get("chunk_d", 128))
+        cap = 2 ** (sc_prec - 1) if halve else 2 ** sc_prec
+        residual_width = {str(k): int(v)
+                          for k, v in (section.get("residual_width") or {}).items()}
+        if not residual_width:
+            raise ValueError(
+                "k_bands.residual_width is required: band widths price the "
+                "iso-cost identity and cannot be inferred at load time.")
+
+        chunk_bands: dict[tuple[str, int], list[int]] = {}
+        # band -> width, per operator; must agree across every block of an op
+        op_band_widths: dict[str, list[int]] = {}
+        for key_str, band_ids in (section.get("chunk_bands") or {}).items():
+            operator, block_idx, _ = _parse_protected_channel_key(key_str)
+            if operator not in residual_width:
+                raise ValueError(
+                    f"k_bands.chunk_bands has '{key_str}' but no "
+                    f"residual_width['{operator}'].")
+            widths = residual_chunk_widths(residual_width[operator], chunk_d)
+            bands = [int(b) for b in band_ids]
+            if len(bands) != len(widths):
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] has {len(bands)} "
+                    f"entries but the residual has {len(widths)} chunks "
+                    f"(residual_width={residual_width[operator]}, "
+                    f"chunk_d={chunk_d}).")
+            if any(b < 0 or b >= n_bands for b in bands):
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] has a band id outside "
+                    f"[0, {n_bands}).")
+            n_op = max(bands) + 1
+            counts = [bands.count(b) for b in range(n_op)]
+            if min(counts) < 2:
+                # A band of a single chunk is <= chunk_d wide and would fall
+                # off the chunked kernel path onto a different quantization
+                # implementation (sc/kernels.py gates on `D > chunk_d`).
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] leaves a band with "
+                    f"{min(counts)} chunk(s); every band needs >= 2 so its "
+                    f"width exceeds chunk_d={chunk_d}.")
+            bw = _band_widths(bands, widths, n_op)
+            prior = op_band_widths.setdefault(operator, bw)
+            if prior != bw:
+                # Ladders are per (op, layer-bucket) but membership is per
+                # (op, block); if widths drifted across blocks of a bucket the
+                # per-rung identity could not hold for all of them at once.
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] gives band widths {bw}, "
+                    f"but another block of '{operator}' gives {prior}. Band "
+                    f"widths must be constant per operator so one ladder set "
+                    f"can satisfy the iso-cost identity for every block.")
+            chunk_bands[(operator, block_idx)] = bands
+
+        ladders: dict[tuple[str, int, int], list[list[int]]] = {}
+        for bucket_key, per_band in (section.get("ladders") or {}).items():
+            operator, t_bucket, l_bucket = _parse_bucket_key(bucket_key)
+            # Band count is PER OPERATOR. `n_bands` is the MAXIMUM: an operator
+            # whose residual has too few chunks to give every band >= 2 uses
+            # fewer. Requiring exactly n_bands everywhere silently dropped every
+            # narrow projection (~19 chunks) out of the K-band path whenever
+            # n_bands was raised for down_proj (71 chunks), which is what made
+            # `--n-bands 16` cover 4 of 28 buckets.
+            n_op = len(per_band)
+            if n_op < 2 or n_op > n_bands:
+                raise ValueError(
+                    f"k_bands.ladders['{bucket_key}'] has {n_op} ladders; "
+                    f"expected between 2 and n_bands={n_bands}.")
+            op_bands = {b for (op, _), bm in chunk_bands.items() if op == operator
+                        for b in bm}
+            if op_bands and max(op_bands) + 1 != n_op:
+                raise ValueError(
+                    f"k_bands.ladders['{bucket_key}'] has {n_op} ladders but "
+                    f"'{operator}' chunk_bands use {max(op_bands) + 1} bands.")
+            parent = self.get_levels(
+                operator=operator,
+                block_idx=l_bucket, total_blocks=self.layer_buckets)
+            band_ladders = []
+            for b, rungs in enumerate(per_band):
+                rungs = [int(x) for x in rungs]
+                if len(rungs) != len(parent):
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] band {b} has "
+                        f"{len(rungs)} rungs but the row ladder has "
+                        f"{len(parent)}; the row's rung index indexes EVERY "
+                        f"band ladder, so they must agree.")
+                if any(r <= 0 for r in rungs):
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] band {b} has a "
+                        f"non-positive rung: {rungs}.")
+                # Above the halved cap the stream WRAPS -- the result is
+                # meaningless rather than merely worse -- and a band that
+                # "wins" by overrunning it would look like a Phase-3 gain.
+                if any(r > cap for r in rungs):
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] band {b} exceeds the "
+                        f"stream-length cap {cap}: {rungs}.")
+                band_ladders.append(rungs)
+            widths = op_band_widths.get(operator)
+            if widths is None:
+                raise ValueError(
+                    f"k_bands.ladders['{bucket_key}'] has no matching "
+                    f"chunk_bands entry for operator '{operator}'.")
+            if len(widths) != n_op:
+                raise ValueError(
+                    f"k_bands.ladders['{bucket_key}'] has {n_op} ladders but "
+                    f"'{operator}' has {len(widths)} band widths.")
+            total = float(sum(widths))
+            for k, parent_len in enumerate(parent):
+                # per-operator band count, NOT the global maximum
+                realized = sum(widths[b] * band_ladders[b][k]
+                               for b in range(n_op)) / total
+                # ONE-SIDED. Overspending breaks the iso-compute claim and is a
+                # hard error. UNDERspending cannot: it only means the cell used
+                # less compute than the parent, so a quality win there is
+                # strictly stronger, not weaker. A two-sided check was correct
+                # only while the solver was two-sided; discrete water-filling
+                # legitimately leaves a fraction of a cycle unspent when the
+                # measurement grid is coarse, and rejecting that threw away
+                # valid allocations (v_proj:t0:l1 at 47.70 vs parent 48).
+                if realized - parent_len > self.K_BAND_ISO_COST_TOL:
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] OVERSPENDS at rung "
+                        f"{k}: MAC-weighted band mean {realized:.4f} vs parent "
+                        f"rung {parent_len} (tolerance "
+                        f"{self.K_BAND_ISO_COST_TOL}). Phase 3 redistributes "
+                        f"stream length, it does not spend more.")
+                if parent_len - realized > self.K_BAND_MAX_UNDERSPEND:
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] UNDERSPENDS at rung "
+                        f"{k} by {parent_len - realized:.4f} cycles (limit "
+                        f"{self.K_BAND_MAX_UNDERSPEND}). That is safe for the "
+                        f"iso-compute claim but means the solver is leaving "
+                        f"budget on the table — investigate the grid, do not "
+                        f"just widen this.")
+            ladders[(operator, t_bucket, l_bucket)] = band_ladders
+
+        missing = {op for (op, _) in chunk_bands} - {op for (op, _, _) in ladders}
+        if missing:
+            raise ValueError(
+                f"k_bands: operators {sorted(missing)} have chunk_bands but no "
+                f"ladders; they would silently run per-row.")
+
+        self.k_band_count = n_bands
+        self.k_band_chunk_d = chunk_d
+        self.k_band_chunks = chunk_bands
+        self.k_band_ladders = ladders
+        self.k_band_residual_width = residual_width
+
+    def get_k_bands(
+        self,
+        operator: Optional[str],
+        block_idx: Optional[int],
+        total_blocks: Optional[int],
+        *,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+    ):
+        """(band_of_chunk, band_ladders) for one module, or None to run per-row.
+
+        ``band_of_chunk[c]`` is the band owning residual chunk ``c`` (ascending
+        chunk order, tail last); ``band_ladders[b][k]`` is the stream length
+        band ``b`` runs when the row landed on rung ``k``.
+        """
+        if not self.k_band_count or operator is None or block_idx is None:
+            return None
+        bands = self.k_band_chunks.get((operator, int(block_idx)))
+        if bands is None:
+            return None
+        t_bucket = _bucket_index(timestep, total_timesteps, self.timestep_buckets)
+        l_bucket = _bucket_index(block_idx, total_blocks, self.layer_buckets) \
+            if total_blocks is not None else 0
+        ladders = self.k_band_ladders.get((operator, t_bucket, l_bucket))
+        if ladders is None:
+            return None
+        return bands, ladders
+
+    def get_levels(
+        self,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        total_blocks: Optional[int] = None,
+    ) -> list[int]:
+        """Per-(operator, layer-bucket) ladder, falling back to the global one.
+
+        The calibrated table historically carried ONE ladder shared by every
+        one of its 36 (op x layer-quartile) buckets, with only the thresholds
+        varying per bucket.  Measured occupancy shows that wastes roughly half
+        the rungs: on 14B t32 the MLP buckets put ZERO MAC on rungs 0-1 (97,
+        64) while qk puts 94-97% on rung 0 and nothing below rung 2 -- the two
+        populations live at opposite ends of a shared ladder, so each gets
+        about half the available resolution.
+
+        When ``bucket_stoc_len_levels`` is empty this returns the global list
+        UNCHANGED (identity is preserved, not just equality), so a table
+        without per-group ladders behaves exactly as before.
+
+        Bucket resolution deliberately mirrors ``get_thresholds`` so a bucket's
+        ladder and its thresholds can never disagree about which bucket it is.
+        """
+        if (self.bucket_stoc_len_levels and operator
+                and block_idx is not None and total_blocks is not None):
+            t_bucket = _bucket_index(timestep, total_timesteps,
+                                     self.timestep_buckets)
+            l_bucket = _bucket_index(block_idx, total_blocks,
+                                     self.layer_buckets)
+            levels = self.bucket_stoc_len_levels.get(
+                (operator, t_bucket, l_bucket))
+            if levels is not None:
+                return levels
+        if operator and operator in self.operator_default_stoc_len_levels:
+            return self.operator_default_stoc_len_levels[operator]
+        return self.stoc_len_levels
+
+    def _escape_threshold_from_payload(self, bucket_payload) -> Optional[float]:
+        """t_esc = metric_mean + k * metric_std for one table payload.
+
+        Returns None when the gate is off or the payload has no stats.
+        Deliberately NOT clamped to <= 1.0 — a t_esc >= 1.0 never fires
+        because the normalized metric support is [0, 1]."""
+        if self.escape_gate_k is None or not isinstance(bucket_payload, dict):
+            return None
+        mu = bucket_payload.get("metric_mean")
+        sigma = bucket_payload.get("metric_std")
+        if mu is None or sigma is None:
+            return None
+        return float(mu) + float(self.escape_gate_k) * float(sigma)
+
+    def get_escape_threshold(
+        self,
+        timestep: int,
+        total_timesteps: int,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        total_blocks: Optional[int] = None,
+    ) -> Optional[float]:
+        """Escape-gate threshold for one operator/timestep/block bucket.
+
+        Mirrors :meth:`get_thresholds` lookup order (bucket, then operator
+        default). None = the gate cannot fire for this call (gate off, or no
+        stats for this bucket)."""
+        if self.escape_gate_k is None:
+            return None
+        if (self.bucket_escape_thresholds and operator and block_idx is not None
+                and total_blocks is not None):
+            t_bucket = _bucket_index(timestep, total_timesteps, self.timestep_buckets)
+            l_bucket = _bucket_index(block_idx, total_blocks, self.layer_buckets)
+            t_esc = self.bucket_escape_thresholds.get((operator, t_bucket, l_bucket))
+            if t_esc is not None:
+                return t_esc
+        if operator and operator in self.operator_default_escape_thresholds:
+            return self.operator_default_escape_thresholds[operator]
+        return None
+
+    def classify_level_values(
+        self,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        total_blocks: Optional[int] = None,
+    ) -> list[int]:
+        """Level-index -> stoc_len map for consumers of ``row_levels``.
+
+        MUST resolve the SAME bucket that produced ``row_levels``.  The SC
+        attention path classifies rows with adaptive_classify_rows (which uses
+        the bucket's own ladder via get_levels) and then maps index -> stream
+        length through here.  When this ignored the bucket and returned the
+        global list, indices stayed in range (the ladders have equal length)
+        but every row ran at the WRONG stream length -- silently, since
+        nothing downstream cross-checks the two.  It surfaced only as a
+        realized-cost reconciliation failure ("SC lengths outside the
+        adaptive/protected set") once per-group ladders diverged.
+
+        With the escape gate ON and ``escape_stoc_len`` not already a rung,
+        escaped rows carry level index ``len(levels)``; this returns the
+        ladder plus that appended escape entry so index-driven dispatch loops
+        cover it. Gate off -- or escape length already a rung -- returns the
+        ladder itself, so the dispatch loop is byte-identical to the pre-gate
+        code. The appended entry intentionally breaks the descending-order
+        convention: this is an index map for dispatch, not a ladder."""
+        levels = self.get_levels(
+            timestep=timestep,
+            total_timesteps=total_timesteps,
+            operator=operator,
+            block_idx=block_idx,
+            total_blocks=total_blocks,
+        )
+        if (self.escape_gate_k is None
+                or int(self.escape_stoc_len) in levels):
+            return levels
+        return list(levels) + [int(self.escape_stoc_len)]
+
+    def get_dispatch_metric(self, operator: Optional[str]) -> tuple[str, float]:
+        """(metric_name, sign) for one operator's per-row dispatch.
+
+        Default ("amax", +1.0) — the original dispatch — for operators the
+        table did not switch (or when the table predates dispatch_metrics)."""
+        if operator and self.dispatch_metrics:
+            return self.dispatch_metrics.get(operator, ("amax", 1.0))
+        return ("amax", 1.0)
+
+    def get_protected_channels(
+        self,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        unit_idx: Optional[int] = None,
+    ) -> Optional[list[int]]:
+        """Return protected input-channel indices for one linear module."""
+        if not operator or block_idx is None:
+            return None
+        key = (operator, int(block_idx), unit_idx)
+        vals = self.protected_channel_indices.get(key)
+        if vals is not None:
+            return vals
+        return self.protected_channel_indices.get((operator, int(block_idx), None))
 
 
 def adaptive_classify_rows(
@@ -382,7 +913,15 @@ def adaptive_classify_rows(
         RowAssignment compatible with existing dispatch code.
     """
     N = metric.shape[0]
-    levels = config.stoc_len_levels
+    # Per-group ladder when the table declares one; otherwise this IS
+    # config.stoc_len_levels, so the no-groups path is byte-identical.
+    levels = config.get_levels(
+        timestep=timestep,
+        total_timesteps=total_timesteps,
+        operator=operator,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+    )
     n_levels = len(levels)
 
     # Empty row batch — e.g. a MoE expert that received ZERO tokens this forward
@@ -451,7 +990,15 @@ def adaptive_classify_rows(
         total_blocks=total_blocks,
     )
     if calibrated_thresholds is not None:
-        return _classify_rows_by_thresholds(metric_norm, levels, calibrated_thresholds)
+        assignment = _classify_rows_by_thresholds(
+            metric_norm, levels, calibrated_thresholds)
+        _apply_escape_gate(
+            assignment, metric_norm, config,
+            operator=operator, block_idx=block_idx,
+            total_blocks=total_blocks,
+            timestep=timestep, total_timesteps=total_timesteps,
+        )
+        return assignment
 
     # No path matched (not free-boundary, no target_fractions, and no
     # calibrated thresholds for this operator/bucket). There is no closed-form
@@ -463,6 +1010,73 @@ def adaptive_classify_rows(
         f"operator_default). Re-run calibration covering this operator/layer, "
         f"or set target_fractions."
     )
+
+
+def _apply_escape_gate(
+    assignment: RowAssignment,
+    metric_norm: torch.Tensor,
+    config: AdaptiveMPConfig,
+    *,
+    operator: Optional[str],
+    block_idx: Optional[int],
+    total_blocks: Optional[int],
+    timestep: int,
+    total_timesteps: int,
+) -> None:
+    """In-place absolute escape gate (R7) on a threshold classification.
+
+    Rows with normalized metric STRICTLY above t_esc_b = mu_b + k * sigma_b
+    (per-bucket constants precomputed at table load) are reassigned to
+    ``config.escape_stoc_len`` regardless of the band thresholds. The compare
+    happens in the same post-sign normalized space the band thresholds live
+    in, so no extra sign handling is needed (sign −1 metrics arrive already
+    negated; min–max normalization maps them to 1 − normalized(raw), exactly
+    as calibration stored them before computing mu/sigma).
+
+    Escaped rows get level index ``len(stoc_len_levels)`` (a NEW index one
+    past the ladder) and a ``level_row_indices[escape_stoc_len]`` entry —
+    unless the escape length already is a ladder rung, in which case they are
+    folded into that rung's existing index. Gate off (``escape_gate_k`` None
+    ⇒ ``get_escape_threshold`` returns None) leaves the assignment untouched.
+    """
+    t_esc = config.get_escape_threshold(
+        timestep=timestep,
+        total_timesteps=total_timesteps,
+        operator=operator,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+    )
+    if t_esc is None or t_esc >= 1.0:
+        # t_esc >= 1.0 can never fire: metric_norm lives in [0, 1] with max
+        # EXACTLY 1.0 and the compare is strict. Skipping the tensor compare
+        # here is a shortcut, not a clamp — behavior is identical.
+        return
+    esc_mask = metric_norm > metric_norm.new_tensor(t_esc)
+    if not bool(esc_mask.any().item()):
+        return
+    # MUST be the SAME ladder the classification used (adaptive_classify_rows
+    # resolves it via get_levels). Reading config.stoc_len_levels here instead
+    # was latent-correct only while every bucket shared the global ladder: the
+    # rebuild below re-keys level_row_indices by stoc_len VALUE, so with a
+    # per-bucket ladder every row would be re-keyed to the GLOBAL rung value at
+    # its index and the bucket's ladder would be silently discarded. That is
+    # unobservable in realized_flop_avg_sl (the tracker prices the assignment it
+    # is handed), so the cell would look in-budget while running wrong lengths.
+    levels = config.get_levels(
+        timestep=timestep,
+        total_timesteps=total_timesteps,
+        operator=operator,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+    )
+    esc_sl = int(config.escape_stoc_len)
+    esc_idx = levels.index(esc_sl) if esc_sl in levels else len(levels)
+    assignment.row_levels[esc_mask] = esc_idx
+    for level_idx, sl in enumerate(levels):
+        assignment.level_row_indices[sl] = torch.where(
+            assignment.row_levels == level_idx)[0]
+    if esc_idx == len(levels):
+        assignment.level_row_indices[esc_sl] = torch.where(esc_mask)[0]
 
 
 # =====================================================================
