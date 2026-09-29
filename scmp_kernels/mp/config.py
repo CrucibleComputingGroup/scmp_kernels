@@ -77,6 +77,29 @@ def _bucket_index(value: int, total: int, num_buckets: int) -> int:
     return min(num_buckets - 1, int(ratio * num_buckets))
 
 
+def _parse_chunk_band_key(key: str) -> tuple[str, int]:
+    """Parse ``k_bands.chunk_bands`` keys into ``(operator, block_idx)``.
+
+    Both table schemas in use are accepted: ``'<op>:b<N>'`` (scmp_llm's
+    ``mp_kbands.py``, same style as protected-channel keys) and ``'<op>:<N>'``
+    (scmp_diffusion's ``build_kband_table.py``). A trailing ``:u<M>`` unit
+    suffix is tolerated and ignored -- band membership is per block.
+    """
+    parts = str(key).split(":")
+    try:
+        if len(parts) not in (2, 3):
+            raise ValueError
+        operator, b_part = parts[0], parts[1]
+        if b_part.startswith("b"):
+            b_part = b_part[1:]
+        if len(parts) == 3 and not parts[2].startswith("u"):
+            raise ValueError
+        return operator, int(b_part)
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid k_bands.chunk_bands key '{key}'. Expected "
+            f"'<operator>:b<block_idx>' or '<operator>:<block_idx>'.") from exc
+
 def _parse_bucket_key(bucket_key: str) -> tuple[str, int, int]:
     """Parse calibration keys like 'proj:t3:l1'."""
     try:
@@ -495,10 +518,11 @@ class AdaptiveMPConfig:
                 "Recalibrate with a calibrator that exports metric stats, or "
                 "unset escape_gate_k.")
 
+        _halve = payload.get("halve_bipolar_stoc_len")
         self._load_k_bands(
             payload.get("k_bands"),
             sc_prec=int(payload.get("sc_prec", 8)),
-            halve=bool(payload.get("halve_bipolar_stoc_len", True)))
+            halve=None if _halve is None else bool(_halve))
 
         protected = payload.get("protected_channels") or {}
         indices = protected.get("indices") or {}
@@ -551,13 +575,47 @@ class AdaptiveMPConfig:
     K_BAND_MAX_UNDERSPEND = 2.0
 
     def _load_k_bands(self, section, sc_prec: int = 8,
-                      halve: bool = True) -> None:
-        """Parse and VALIDATE the k_bands section (Phase 3).
+                      halve: Optional[bool] = None) -> None:
+        """Parse and VALIDATE the ``k_bands`` section (Phase 3: per-group
+        stream lengths on the contraction axis).
+
+        Schema (``chunk_bands`` accepts both ``'<op>:b<N>'`` and ``'<op>:<N>'``
+        keys, see :func:`_parse_chunk_band_key`)::
+
+            "k_bands": {
+              "n_bands": 4,
+              "chunk_d": 128,
+              "residual_width": {"mlp_fc1": 1152, ...},
+              "chunk_bands":  {"mlp_fc1:b0": [0,0,1,1,2,2,3,3,3], ...},
+              "ladders":      {"mlp_fc1:t0:l0": [[...], [...], ...], ...}
+            }
 
         Everything here is a hard failure rather than a fallback: a malformed
         band spec that silently degrades to per-row would produce a cell that
         looks like a Phase-3 result but is not one, and realized_flop_avg_sl
-        would not reveal it.
+        would not reveal it. Two invariants are enforced at load because a
+        mispriced allocation looks exactly like a win downstream:
+
+        1. **Whole chunks.** Bands own whole quantization chunks (the kernel
+           builds its RNG tables over ``chunk_d`` dims and reuses them per
+           chunk), and every band needs >= 2 chunks to stay on the chunked
+           path. Band count is PER OPERATOR; ``n_bands`` is the maximum.
+        2. **Per-rung iso-compute.** MACs are linear in the contraction dim,
+           so a band's column fraction IS its MAC fraction::
+
+               sum_b (w_b / R) * L[b][k] == L_parent[k]     for every rung k
+
+           Overspend beyond ``K_BAND_ISO_COST_TOL`` is a hard error. Underspend
+           is safe for the iso-compute claim (a win at lower cost is stronger)
+           but bounded by ``K_BAND_MAX_UNDERSPEND``: a solver leaving many
+           cycles unspent is a bug, not conservatism.
+
+        ``sc_prec`` / ``halve`` are the table's own ``sc_prec`` and
+        ``halve_bipolar_stoc_len`` declarations. The stream-length cap is
+        ``2**(sc_prec-1)`` when the table declares halve and ``2**sc_prec``
+        otherwise (``halve=None`` = table is silent -> full-grid cap; the
+        sc_matmul halve guard still raises at runtime on any stream above the
+        halved maximum, so a silent table cannot slip past it).
         """
         if not section:
             return
@@ -566,7 +624,9 @@ class AdaptiveMPConfig:
             raise ValueError(
                 f"k_bands.n_bands must be >= 2 (got {n_bands}); omit the "
                 f"section entirely to run the per-row parent.")
-        chunk_d = int(section.get("chunk_d", 128))
+        chunk_d = int(section.get("chunk_d", self.k_band_chunk_d))
+        if chunk_d <= 0:
+            raise ValueError(f"k_bands.chunk_d must be positive, got {chunk_d}.")
         cap = 2 ** (sc_prec - 1) if halve else 2 ** sc_prec
         residual_width = {str(k): int(v)
                           for k, v in (section.get("residual_width") or {}).items()}
@@ -579,7 +639,7 @@ class AdaptiveMPConfig:
         # band -> width, per operator; must agree across every block of an op
         op_band_widths: dict[str, list[int]] = {}
         for key_str, band_ids in (section.get("chunk_bands") or {}).items():
-            operator, block_idx, _ = _parse_protected_channel_key(key_str)
+            operator, block_idx = _parse_chunk_band_key(key_str)
             if operator not in residual_width:
                 raise ValueError(
                     f"k_bands.chunk_bands has '{key_str}' but no "
@@ -588,7 +648,7 @@ class AdaptiveMPConfig:
             bands = [int(b) for b in band_ids]
             if len(bands) != len(widths):
                 raise ValueError(
-                    f"k_bands.chunk_bands['{key_str}'] has {len(bands)} "
+                    f"k_bands.chunk_bands['{key_str}'] has {len(bands)} chunk "
                     f"entries but the residual has {len(widths)} chunks "
                     f"(residual_width={residual_width[operator]}, "
                     f"chunk_d={chunk_d}).")
@@ -596,16 +656,35 @@ class AdaptiveMPConfig:
                 raise ValueError(
                     f"k_bands.chunk_bands['{key_str}'] has a band id outside "
                     f"[0, {n_bands}).")
+            # Band count is PER OPERATOR. `n_bands` is the MAXIMUM: an operator
+            # whose residual has too few chunks to give every band >= 2 uses
+            # fewer. Requiring exactly n_bands everywhere silently dropped every
+            # narrow projection (~19 chunks) out of the K-band path whenever
+            # n_bands was raised for down_proj (71 chunks).
             n_op = max(bands) + 1
-            counts = [bands.count(b) for b in range(n_op)]
-            if min(counts) < 2:
-                # A band of a single chunk is <= chunk_d wide and would fall
-                # off the chunked kernel path onto a different quantization
-                # implementation (sc/kernels.py gates on `D > chunk_d`).
+            if sorted(set(bands)) != list(range(n_op)):
                 raise ValueError(
-                    f"k_bands.chunk_bands['{key_str}'] leaves a band with "
-                    f"{min(counts)} chunk(s); every band needs >= 2 so its "
-                    f"width exceeds chunk_d={chunk_d}.")
+                    f"k_bands.chunk_bands['{key_str}'] uses band ids "
+                    f"{sorted(set(bands))}, which skip a band. Ids must be "
+                    f"0..n-1 contiguous: a band's position IS its index into "
+                    f"the ladder.")
+            if n_op < 2:
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] uses {n_op} band(s); "
+                    f"every banded operator needs >= 2 bands -- drop the "
+                    f"operator instead of banding it into one piece.")
+            for b in range(n_op):
+                owned = bands.count(b)
+                if owned < 2:
+                    # A band of a single chunk is <= chunk_d wide and would
+                    # fall off the chunked kernel path onto a different
+                    # quantization implementation (sc/kernels.py gates on
+                    # `D > chunk_d`).
+                    raise ValueError(
+                        f"k_bands.chunk_bands['{key_str}'] leaves band {b} "
+                        f"with {owned} chunk(s); every band needs >= 2 so its "
+                        f"width exceeds chunk_d={chunk_d} and stays on the "
+                        f"chunked kernel path.")
             bw = _band_widths(bands, widths, n_op)
             prior = op_band_widths.setdefault(operator, bw)
             if prior != bw:
@@ -622,23 +701,22 @@ class AdaptiveMPConfig:
         ladders: dict[tuple[str, int, int], list[list[int]]] = {}
         for bucket_key, per_band in (section.get("ladders") or {}).items():
             operator, t_bucket, l_bucket = _parse_bucket_key(bucket_key)
-            # Band count is PER OPERATOR. `n_bands` is the MAXIMUM: an operator
-            # whose residual has too few chunks to give every band >= 2 uses
-            # fewer. Requiring exactly n_bands everywhere silently dropped every
-            # narrow projection (~19 chunks) out of the K-band path whenever
-            # n_bands was raised for down_proj (71 chunks), which is what made
-            # `--n-bands 16` cover 4 of 28 buckets.
             n_op = len(per_band)
             if n_op < 2 or n_op > n_bands:
                 raise ValueError(
                     f"k_bands.ladders['{bucket_key}'] has {n_op} ladders; "
                     f"expected between 2 and n_bands={n_bands}.")
-            op_bands = {b for (op, _), bm in chunk_bands.items() if op == operator
-                        for b in bm}
-            if op_bands and max(op_bands) + 1 != n_op:
+            widths = op_band_widths.get(operator)
+            if widths is None:
+                raise ValueError(
+                    f"k_bands.ladders['{bucket_key}'] has no matching "
+                    f"chunk_bands entry for operator '{operator}'.")
+            if len(widths) != n_op:
                 raise ValueError(
                     f"k_bands.ladders['{bucket_key}'] has {n_op} ladders but "
-                    f"'{operator}' chunk_bands use {max(op_bands) + 1} bands.")
+                    f"'{operator}' chunk_bands use {len(widths)} bands.")
+            # Parent = the per-(op, layer-bucket) group ladder when one exists,
+            # else the global stoc_len_levels (get_levels handles the fallback).
             parent = self.get_levels(
                 operator=operator,
                 block_idx=l_bucket, total_blocks=self.layer_buckets)
@@ -649,56 +727,48 @@ class AdaptiveMPConfig:
                     raise ValueError(
                         f"k_bands.ladders['{bucket_key}'] band {b} has "
                         f"{len(rungs)} rungs but the row ladder has "
-                        f"{len(parent)}; the row's rung index indexes EVERY "
-                        f"band ladder, so they must agree.")
+                        f"{len(parent)} rungs, expected {len(parent)}; the "
+                        f"row's rung index indexes EVERY band ladder, so they "
+                        f"must agree.")
                 if any(r <= 0 for r in rungs):
                     raise ValueError(
                         f"k_bands.ladders['{bucket_key}'] band {b} has a "
                         f"non-positive rung: {rungs}.")
-                # Above the halved cap the stream WRAPS -- the result is
-                # meaningless rather than merely worse -- and a band that
-                # "wins" by overrunning it would look like a Phase-3 gain.
+                # Above the cap the stream WRAPS -- the result is meaningless
+                # rather than merely worse -- and a band that "wins" by
+                # overrunning it would look like a Phase-3 gain.
                 if any(r > cap for r in rungs):
                     raise ValueError(
                         f"k_bands.ladders['{bucket_key}'] band {b} exceeds the "
-                        f"stream-length cap {cap}: {rungs}.")
+                        f"stream-length cap {cap} "
+                        f"({'halved grid 2**(sc_prec-1)' if halve else 'full grid 2**sc_prec'}, "
+                        f"sc_prec={sc_prec}): {rungs}.")
                 band_ladders.append(rungs)
-            widths = op_band_widths.get(operator)
-            if widths is None:
-                raise ValueError(
-                    f"k_bands.ladders['{bucket_key}'] has no matching "
-                    f"chunk_bands entry for operator '{operator}'.")
-            if len(widths) != n_op:
-                raise ValueError(
-                    f"k_bands.ladders['{bucket_key}'] has {n_op} ladders but "
-                    f"'{operator}' has {len(widths)} band widths.")
             total = float(sum(widths))
             for k, parent_len in enumerate(parent):
-                # per-operator band count, NOT the global maximum
                 realized = sum(widths[b] * band_ladders[b][k]
                                for b in range(n_op)) / total
                 # ONE-SIDED. Overspending breaks the iso-compute claim and is a
                 # hard error. UNDERspending cannot: it only means the cell used
                 # less compute than the parent, so a quality win there is
-                # strictly stronger, not weaker. A two-sided check was correct
-                # only while the solver was two-sided; discrete water-filling
+                # strictly stronger, not weaker. Discrete water-filling
                 # legitimately leaves a fraction of a cycle unspent when the
-                # measurement grid is coarse, and rejecting that threw away
-                # valid allocations (v_proj:t0:l1 at 47.70 vs parent 48).
+                # measurement grid is coarse (v_proj:t0:l1 at 47.70 vs 48).
                 if realized - parent_len > self.K_BAND_ISO_COST_TOL:
                     raise ValueError(
-                        f"k_bands.ladders['{bucket_key}'] OVERSPENDS at rung "
-                        f"{k}: MAC-weighted band mean {realized:.4f} vs parent "
-                        f"rung {parent_len} (tolerance "
-                        f"{self.K_BAND_ISO_COST_TOL}). Phase 3 redistributes "
-                        f"stream length, it does not spend more.")
+                        f"k_bands.ladders['{bucket_key}'] overspends rung {k} "
+                        f"(OVERSPENDS the iso-compute budget): MAC-weighted "
+                        f"band mean {realized:.4f} vs parent rung {parent_len} "
+                        f"(tolerance {self.K_BAND_ISO_COST_TOL} cycles). "
+                        f"Phase 3 redistributes stream length, it does not "
+                        f"spend more.")
                 if parent_len - realized > self.K_BAND_MAX_UNDERSPEND:
                     raise ValueError(
-                        f"k_bands.ladders['{bucket_key}'] UNDERSPENDS at rung "
-                        f"{k} by {parent_len - realized:.4f} cycles (limit "
-                        f"{self.K_BAND_MAX_UNDERSPEND}). That is safe for the "
-                        f"iso-compute claim but means the solver is leaving "
-                        f"budget on the table — investigate the grid, do not "
+                        f"k_bands.ladders['{bucket_key}'] underspends rung {k} "
+                        f"(UNDERSPENDS by {parent_len - realized:.4f} cycles, "
+                        f"limit {self.K_BAND_MAX_UNDERSPEND}). That is safe for "
+                        f"the iso-compute claim but means the solver is leaving "
+                        f"budget on the table -- investigate the grid, do not "
                         f"just widen this.")
             ladders[(operator, t_bucket, l_bucket)] = band_ladders
 
@@ -706,7 +776,7 @@ class AdaptiveMPConfig:
         if missing:
             raise ValueError(
                 f"k_bands: operators {sorted(missing)} have chunk_bands but no "
-                f"ladders; they would silently run per-row.")
+                f"ladders entry; they would silently run per-row.")
 
         self.k_band_count = n_bands
         self.k_band_chunk_d = chunk_d
