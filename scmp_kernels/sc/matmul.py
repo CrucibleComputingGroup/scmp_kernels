@@ -28,10 +28,18 @@ from .kernels import (
     _sc_matmul_per_head_bipolar,
 )
 from ..quant.smoothquant import apply_smoothing
+from .. import trace as _trace
 
 
 _VALID_GRANULARITIES = ("per_tensor", "per_row", "per_head")
 _VALID_MODES = ("bipolar", "unipolar")
+_VALID_METHODS = ("auto", "table", "compact")
+
+# Method aliases for the pure-Python CPU enable-signal reference.
+_CPU_METHOD_NAMES = {
+    "table": "k_shortcut",      # builds cum_indicator prefix-sum table
+    "compact": "cycle_by_cycle",  # no tables — bit-by-bit simulation
+}
 
 
 def _pin_to_operand_device(fn):
@@ -94,6 +102,7 @@ def _sc_matmul_impl(
     config: Optional[dict] = None,
     halve_bipolar_stoc_len: bool = False,
     smooth_scales: Optional[torch.Tensor] = None,
+    method: str = "auto",
 ) -> torch.Tensor:
     """Stochastic-computing matmul ``a @ b.T``.
 
@@ -152,6 +161,22 @@ def _sc_matmul_impl(
             calibration statistics via
             :func:`scmp_kernels.quant.compute_smooth_scales`. ``None``
             (default) leaves behavior unchanged.
+        method: enable-signal computation method.
+
+            * ``"auto"`` (default) — Triton GPU kernels. Internal dispatch
+              between table-based and compact Triton paths is driven by the
+              ``_COMPACT_ENABLE_THRESHOLD_BYTES`` heuristic (and the
+              ``SC_FORCE_COMPACT`` / ``SC_FORCE_TABLE`` env vars).
+            * ``"table"`` — pure-Python ``k_shortcut`` (prefix-sum lookup).
+              Runs on CPU; useful as a reference oracle when GPU is busy.
+            * ``"compact"`` — pure-Python ``cycle_by_cycle`` (no tables —
+              bitstream simulation). Slowest but lowest memory; the
+              definitional spec of enable-signal SC.
+
+            ``"table"`` / ``"compact"`` route through
+            :func:`scmp_kernels.sc.sc_enable.sc_matmul_enable` and currently
+            only support ``granularity="per_tensor"``. Other granularities
+            with non-``"auto"`` method raise ``ValueError``.
 
     Returns:
         Output tensor. 2D inputs → ``(N, M)`` float32. 3D inputs → ``(BH, N, M)``
@@ -175,6 +200,39 @@ def _sc_matmul_impl(
         raise ValueError(
             f"sc_matmul: unknown mode '{mode}'. "
             f"Expected one of {_VALID_MODES}.")
+    if method not in _VALID_METHODS:
+        raise ValueError(
+            f"sc_matmul: unknown method '{method}'. "
+            f"Expected one of {_VALID_METHODS}.")
+
+    # ---- CPU pure-Python enable-signal path ---------------------------------
+    # method="table" / "compact" route through the per-tensor pure-Python
+    # reference in sc_enable.py. Used to verify correctness when GPU is
+    # unavailable; the Triton path stays the default ("auto").
+    if method != "auto":
+        if granularity != "per_tensor":
+            raise ValueError(
+                f"sc_matmul: method='{method}' only supports "
+                f"granularity='per_tensor', got '{granularity}'. The CPU "
+                f"enable-signal reference is per-tensor only.")
+        if chunk_d > 0:
+            raise ValueError(
+                f"sc_matmul: method='{method}' is incompatible with chunk_d > 0 "
+                f"(chunk_d is a Triton MLP fast-path knob).")
+        if smooth_scales is not None:
+            a, b = apply_smoothing(a, b, smooth_scales)
+        a_max = a.max().item()
+        a_min = a.min().item()
+        b_max = b.max().item()
+        b_min = b.min().item()
+        from .sc_enable import sc_matmul_enable
+        cpu_method = _CPU_METHOD_NAMES[method]
+        return sc_matmul_enable(
+            a, b,
+            max_fp_a=a_max, min_fp_a=a_min,
+            max_fp_b=b_max, min_fp_b=b_min,
+            mode=mode, sc_prec=sc_prec, config=config, method=cpu_method,
+        )
 
     # ---- uSystolic / HUB sign-magnitude cycle-halving (wu-hpca2022) ----------
     # Bipolar mode is already sign-magnitude with q_max = 2^(sc_prec-1) - 1,
@@ -241,6 +299,34 @@ def _sc_matmul_impl(
             raise ValueError(
                 f"sc_matmul: granularity='per_head' currently only supports "
                 f"mode='bipolar', got '{mode}'.")
+
+    # ---- precision trace (see scmp_kernels/trace.py) -------------------------
+    # Host-side shape metadata only — no tensor reads, no device sync. The
+    # bool guard keeps the off-path cost at one attribute read. Placed after
+    # the validation gates so rejected calls are never recorded, and after the
+    # halving block so stoc_len is the TRUE cycle count.
+    if _trace._ENABLED:
+        if a.dim() == 3:
+            _batch, _rows, _d_in = a.shape
+        else:
+            _rows, _d_in = a.shape
+            _batch = 1
+        _trace.record_matmul(
+            rows=int(_rows), d_in=int(_d_in), d_out=int(b.shape[-2]),
+            batch=int(_batch),
+            stoc_len=int(stoc_len) if stoc_len is not None else 2 ** sc_prec,
+            sc_prec=sc_prec, mode=mode, granularity=granularity,
+            # halving only takes effect in bipolar mode (guard above) — record
+            # whether it was APPLIED, not merely requested, to keep the field
+            # consistent with the effective stoc_len/rng_levels.
+            halve=bool(halve_bipolar_stoc_len and mode == "bipolar"),
+            # RESOLVED enable-grid size (mirrors _resolve_rng_levels), so the
+            # field has one meaning across halved and non-halved runs.
+            rng_levels=(int(rng_levels) if rng_levels is not None
+                        else 2 ** sc_prec),
+            chunk_d=chunk_d,
+            smoothed=smooth_scales is not None,
+        )
 
     # ---- dispatch ------------------------------------------------------------
     if granularity == "per_tensor":

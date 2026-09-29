@@ -123,8 +123,74 @@ def test_full_length_shares_none_tag():
     print("  ok  full-length none tag    identical bits, no cache growth")
 
 
+def _run_mlp_chunked(stoc_len, chunk_d=64):
+    """per_row + bipolar + chunk_d>0 -> _sc_matmul_bipolar_mlp_chunked, whose
+    cum_indicator is served from _cum_indicator_cache (keyed by the caller)."""
+    torch.manual_seed(0)
+    a = torch.randn(8, 256, device="cuda")
+    b = torch.randn(16, 256, device="cuda")
+    return sc_matmul(a, b, granularity="per_row", mode="bipolar",
+                     stoc_len=stoc_len, chunk_d=chunk_d)
+
+
+def test_scramble_mode_in_cum_indicator_cache_key():
+    """The chunked-MLP cum_indicator cache must key on the scramble params too.
+
+    rng_b for the chunked path is post-scramble (_prepare_rng_prefix), so a
+    cache keyed only on (config, sc_prec, chunk_d, stoc_len, rng_levels) would
+    reintroduce the stale-table bug #28 fixed for the enable-table caches.
+    """
+    if not torch.cuda.is_available():
+        print("  skip (no CUDA)")
+        return
+    K.clear_rng_cache()
+
+    with _env(SC_OWEN_MODE=None, SC_SCRAMBLE_MASKS=None, SC_CUM_INDICATOR_CACHE=None):
+        y_bitrev = _run_mlp_chunked(64)
+        n_cum = len(K._cum_indicator_cache)
+        with _env(SC_OWEN_MODE="off"):            # no clear_rng_cache!
+            y_off = _run_mlp_chunked(64)
+        y_bitrev2 = _run_mlp_chunked(64)
+        with _env(SC_SCRAMBLE_MASKS="16"):
+            y_m16 = _run_mlp_chunked(64)
+
+    assert n_cum >= 1, "chunked MLP path did not populate _cum_indicator_cache"
+    d_modes = (y_bitrev - y_off).abs().max().item()
+    assert d_modes > 0.0, (
+        "SC_OWEN_MODE=off returned the bitrev result on the chunked MLP path "
+        "— stale cum_indicator (scramble mode missing from the cum cache key)")
+    d_back = (y_bitrev - y_bitrev2).abs().max().item()
+    assert d_back == 0.0, (
+        f"returning to bitrev must reproduce the original bits, diff {d_back:.3e}")
+    d_m = (y_bitrev - y_m16).abs().max().item()
+    assert d_m > 0.0, (
+        "SC_SCRAMBLE_MASKS=16 returned the M=64 result on the chunked MLP path "
+        "— mask count missing from the cum cache key")
+    print(f"  ok  cum_indicator key      off vs bitrev diff={d_modes:.3e}, "
+          f"M=16 diff={d_m:.3e}, bitrev roundtrip exact")
+
+
+def test_cum_indicator_cache_is_bit_identical():
+    """SC_CUM_INDICATOR_CACHE=0 (per-call rebuild) must match the cached path."""
+    if not torch.cuda.is_available():
+        print("  skip (no CUDA)")
+        return
+    K.clear_rng_cache()
+    with _env(SC_OWEN_MODE=None, SC_SCRAMBLE_MASKS=None, SC_CUM_INDICATOR_CACHE=None):
+        y_cached_1 = _run_mlp_chunked(64)
+        y_cached_2 = _run_mlp_chunked(64)          # served from the cache
+        with _env(SC_CUM_INDICATOR_CACHE="0"):
+            y_rebuild = _run_mlp_chunked(64)
+    assert (y_cached_1 - y_cached_2).abs().max().item() == 0.0
+    d = (y_cached_1 - y_rebuild).abs().max().item()
+    assert d == 0.0, f"cached vs per-call cum_indicator differ, diff {d:.3e}"
+    print("  ok  cum cache bit-identical to per-call rebuild")
+
+
 if __name__ == "__main__":
     test_scramble_mode_in_cache_key()
     test_scramble_mask_count_in_cache_key()
     test_full_length_shares_none_tag()
+    test_scramble_mode_in_cum_indicator_cache_key()
+    test_cum_indicator_cache_is_bit_identical()
     print("\nSCRAMBLE CACHE KEY — ALL PASSED")
