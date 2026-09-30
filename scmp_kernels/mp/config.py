@@ -448,6 +448,10 @@ class AdaptiveMPConfig:
         self.k_band_count = 0
         self.k_band_chunks = {}
         self.k_band_ladders = {}
+        # per-(row, chunk): (operator, t_bucket, l_bucket) -> (levels, thresholds)
+        self.per_row_chunk = {}
+        # layer resolution of the per_row_chunk keys; 0 = the table's layer_buckets
+        self.prc_layer_buckets = 0
         self.k_band_residual_width = {}
 
         for operator, operator_payload in payload.get("operator_defaults", {}).items():
@@ -497,6 +501,11 @@ class AdaptiveMPConfig:
 
         self._load_k_bands(
             payload.get("k_bands"),
+            sc_prec=int(payload.get("sc_prec", 8)),
+            halve=bool(payload.get("halve_bipolar_stoc_len", True)))
+
+        self._load_per_row_chunk(
+            payload.get("per_row_chunk"),
             sc_prec=int(payload.get("sc_prec", 8)),
             halve=bool(payload.get("halve_bipolar_stoc_len", True)))
 
@@ -713,6 +722,90 @@ class AdaptiveMPConfig:
         self.k_band_chunks = chunk_bands
         self.k_band_ladders = ladders
         self.k_band_residual_width = residual_width
+
+    def _load_per_row_chunk(self, section, sc_prec: int = 8,
+                            halve: bool = True) -> None:
+        """Parse and VALIDATE the per_row_chunk section.
+
+        Shape: {"buckets": {"<op>:t<i>:l<j>": {"levels": [...],
+                                               "thresholds": [...]}}}
+
+        Each entry gives one (operator, timestep bucket, layer bucket) its own
+        ladder plus the thresholds that map the normalized per-(row, chunk)
+        absmax onto it. ``thresholds`` must have exactly ``len(levels) - 1``
+        entries, ascending, in [0, 1] -- they are compared against a min-max
+        normalized statistic, so a threshold outside that range silently
+        disables a rung rather than failing.
+        """
+        if not section:
+            return
+        cap = 2 ** (sc_prec - 1) if halve else 2 ** sc_prec
+        # Optional finer layer axis for the per-(row, chunk) keys only (e.g. one
+        # threshold vector per block). Per-row buckets keep the table's
+        # layer_buckets, so attention dispatch is unaffected.
+        self.prc_layer_buckets = int(section.get("layer_buckets", 0) or 0)
+        buckets = section.get("buckets") or {}
+        if not buckets:
+            raise ValueError(
+                "per_row_chunk present but carries no 'buckets'; omit the "
+                "section entirely to run per-row dispatch.")
+        for key_str, entry in buckets.items():
+            operator, t_bucket, l_bucket = _parse_bucket_key(key_str)
+            levels = [int(v) for v in (entry.get("levels") or [])]
+            if len(levels) < 2:
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] needs >= 2 levels, got {levels}")
+            if any(v <= 0 for v in levels):
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] has a non-positive level: {levels}")
+            if max(levels) > cap:
+                # Above the cap the SC stream wraps and the result is
+                # meaningless -- it does not fail, it silently degrades.
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] level {max(levels)} exceeds "
+                    f"the stream cap {cap} (sc_prec={sc_prec}, halve={halve}); "
+                    "results would wrap.")
+            if list(levels) != sorted(levels):
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] levels must be ASCENDING "
+                    f"(rung index r must mean levels[r]); got {levels}")
+            th = [float(v) for v in (entry.get("thresholds") or [])]
+            if len(th) != len(levels) - 1:
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] has {len(th)} thresholds for "
+                    f"{len(levels)} levels; expected {len(levels) - 1}")
+            if list(th) != sorted(th):
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] thresholds must be ascending, "
+                    f"got {th}")
+            if th and (min(th) < 0.0 or max(th) > 1.0):
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] thresholds {th} fall outside "
+                    "[0, 1]; they are compared against a MIN-MAX NORMALIZED "
+                    "statistic, so an out-of-range value silently strands a rung.")
+            if self.prc_layer_buckets and not 0 <= l_bucket < self.prc_layer_buckets:
+                raise ValueError(
+                    f"per_row_chunk['{key_str}'] layer bucket {l_bucket} outside "
+                    f"per_row_chunk.layer_buckets={self.prc_layer_buckets}")
+            self.per_row_chunk[(operator, t_bucket, l_bucket)] = (levels, th)
+
+    def get_per_row_chunk(
+        self,
+        operator: Optional[str],
+        block_idx: Optional[int],
+        total_blocks: Optional[int],
+        *,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+    ):
+        """(levels, thresholds) for one module, or None to run per-row."""
+        if not self.per_row_chunk or operator is None or block_idx is None:
+            return None
+        t_bucket = _bucket_index(timestep, total_timesteps, self.timestep_buckets)
+        n_lb = self.prc_layer_buckets or self.layer_buckets
+        l_bucket = _bucket_index(block_idx, total_blocks, n_lb) \
+            if total_blocks is not None else 0
+        return self.per_row_chunk.get((operator, t_bucket, l_bucket))
 
     def get_k_bands(
         self,

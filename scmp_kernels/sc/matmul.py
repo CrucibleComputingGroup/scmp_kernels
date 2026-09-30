@@ -103,6 +103,8 @@ def _sc_matmul_impl(
     halve_bipolar_stoc_len: bool = False,
     smooth_scales: Optional[torch.Tensor] = None,
     method: str = "auto",
+    rung_table: Optional[torch.Tensor] = None,
+    level_lens=None,
 ) -> torch.Tensor:
     """Stochastic-computing matmul ``a @ b.T``.
 
@@ -274,6 +276,15 @@ def _sc_matmul_impl(
     # fast path. Other granularities and unipolar quantization will silently
     # ignore chunk_d in the underlying kernels, which is a footgun for
     # callers expecting the chunking to take effect. Raise here instead.
+    if rung_table is not None and not (chunk_d > 0 and granularity == "per_row"
+                                       and mode == "bipolar"):
+        raise ValueError(
+            "sc_matmul: rung_table (per-(row, chunk) stream lengths) requires "
+            f"granularity='per_row', mode='bipolar', chunk_d > 0; got "
+            f"granularity={granularity!r}, mode={mode!r}, chunk_d={chunk_d}. "
+            "Every other path would ignore it and run ONE uniform stoc_len "
+            "while still reporting the intended average cost.")
+
     if chunk_d > 0:
         if granularity != "per_row":
             raise ValueError(
@@ -305,7 +316,40 @@ def _sc_matmul_impl(
     # bool guard keeps the off-path cost at one attribute read. Placed after
     # the validation gates so rejected calls are never recorded, and after the
     # halving block so stoc_len is the TRUE cycle count.
-    if _trace._ENABLED:
+    if _trace._ENABLED and rung_table is not None:
+        # A per-(row, chunk) call has NO single stoc_len. Recording one would
+        # price the whole call at L_max -- e.g. a t32 allocation billed at 128,
+        # a 4x overstatement that still looks like a valid trace. Emit one
+        # record per rung instead, with the MACs that actually ran at it.
+        # Grouped by chunk WIDTH so the trace's rows*d_in*d_out == macs
+        # identity survives a short tail chunk.
+        _rows, _d_in = a.shape
+        _d_out = int(b.shape[-2])
+        _n_chunks = (_d_in + chunk_d - 1) // chunk_d
+        _tail = _d_in - chunk_d * (_n_chunks - 1)
+        _rt = rung_table.to(torch.int64)
+        _full = _rt[:, :_n_chunks - 1] if _tail != chunk_d else _rt
+        _grps = [(_full, chunk_d)]
+        if _tail != chunk_d:
+            _grps.append((_rt[:, _n_chunks - 1:], _tail))
+        for _sub, _w in _grps:
+            if _sub.numel() == 0:
+                continue
+            _cnt = torch.bincount(_sub.reshape(-1), minlength=len(level_lens))
+            for _r, _L in enumerate(level_lens):
+                _n = int(_cnt[_r])
+                if _n == 0:
+                    continue
+                _trace.record_matmul(
+                    rows=_n, d_in=int(_w), d_out=_d_out, batch=1,
+                    stoc_len=int(_L), sc_prec=sc_prec, mode=mode,
+                    granularity=granularity,
+                    halve=bool(halve_bipolar_stoc_len and mode == "bipolar"),
+                    rng_levels=(int(rng_levels) if rng_levels is not None
+                                else 2 ** sc_prec),
+                    chunk_d=chunk_d, smoothed=smooth_scales is not None,
+                )
+    elif _trace._ENABLED:
         if a.dim() == 3:
             _batch, _rows, _d_in = a.shape
         else:
@@ -351,6 +395,7 @@ def _sc_matmul_impl(
                 mode=mode, sc_prec=sc_prec, config=config,
                 group_a=group_a, group_b=group_b, chunk_d=chunk_d,
                 stoc_len=stoc_len, rng_levels=rng_levels,
+                rung_table=rung_table, level_lens=level_lens,
             )
         if a.dim() == 3:
             return _sc_matmul_per_row_batched(

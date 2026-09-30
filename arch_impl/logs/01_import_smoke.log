@@ -1,4 +1,0 @@
-package at: /home/allenjin/Projects/SCMP/scmp_kernels/scmp_kernels/__init__.py
-scmp_kernels.quant imports OK
-scmp_kernels.sc.kernels re-exports OK
-backward-compat names point to the same object
