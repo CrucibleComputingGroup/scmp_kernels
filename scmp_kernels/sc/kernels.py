@@ -1022,7 +1022,11 @@ def _get_cached_k_table_stack(
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
     lens = tuple(int(v) for v in level_lens)
     key = (_enable_table_cache_key(config, sc_prec, device)
-           + f"|k_stack|sl={lens}|rng={grid_levels}")
+           + f"|k_stack|sl={lens}|rng={grid_levels}"
+           # every slice is built through _prepare_rng_prefix, so the scramble
+           # params must be in the key (same as k_only / cum, #28). min(lens)
+           # is the most-truncated slice: if THAT one does not scramble, none do.
+           + _scramble_cache_tag(sc_prec, min(lens), grid_levels))
     cached = _lru_get(_k_table_cache, key)
     if cached is not None:
         return cached
